@@ -81,6 +81,8 @@ def all_stale_docs() -> List[str]:
     return list(_ALL_STALE_DOCS)
 
 
+
+
 _CITY_DEPENDENCIES = {
     "OSA": ["dependency:OSA_ht206_rs3001_private_room"],
     "TPE": ["dependency:TPE_ht801_rs4004_badge_bundle"],

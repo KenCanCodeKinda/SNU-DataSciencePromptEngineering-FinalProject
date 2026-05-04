@@ -6,6 +6,14 @@ Final project for SNU's *Data Science & Prompt Engineering* course. We built an 
 
 **Overall score: 81.3 / 100 mean (range 77.55 – 84.22)** at **$0.0033 per episode** (mean raw_score ≈ 36.5).
 
+| Bucket | Weight | Mean | Weighted |
+|---|---|---:|---:|
+| Feasibility | 40% | 0.84 | 33.6 |
+| Preference fit | 30% | 0.79 | 23.7 |
+| Adaptation / memory | 20% | 0.961 | 19.22 |
+| Efficiency | 10% | 0.47 | 4.7 |
+| **Total** | **100%** | | **81.22** |
+
 The headline number swings ±3 points on identical code because feasibility / preference-fit metrics are tied to stochastic LLM output. The deterministic memory-discipline work is the load-bearing part of our design and lands consistently every run.
 
 | Bucket | Weight | Best | Mean | Worst | Notes |

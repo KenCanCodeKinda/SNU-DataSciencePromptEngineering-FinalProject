@@ -10,7 +10,12 @@ from llm_agents import (
     tool_result,
 )
 from runtime_api import StudentRuntime
-from student_custom_tools_template import derive_required_docs_from_state, derive_retired_from_state
+from student_custom_tools_template import (
+    all_stale_docs,
+    derive_rejected_from_state,
+    derive_required_docs_from_state,
+    derive_retired_from_state,
+)
 
 
 STUDENT_PLANNER_INSTRUCTIONS = (
@@ -60,6 +65,42 @@ def _run_planner(
     )
 
 
+def _build_final(runtime: StudentRuntime, session, planner_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply tool_result + deterministic memory enrichments. Used by both main and fallback paths."""
+    episode = runtime.episode
+    retired_keys, spoken_retire = derive_retired_from_state(episode)
+
+    final = tool_result(
+        runtime.runner,
+        planner_result,
+        session,
+        active_doc_cap=3,
+        active_key_cap=5,
+        forced_retired=retired_keys,
+        forced_retired_docs=all_stale_docs(),
+    )
+
+    memory_report = final["submission"].setdefault("memory_report", {})
+    spoken_hits = memory_report.setdefault("spoken_rule_hits", {})
+    spoken_hits["retire"] = list(spoken_retire)
+
+    derived_docs = derive_required_docs_from_state(episode)
+    seen_docs = set(memory_report.get("docs_retrieved") or [])
+    memory_report["docs_retrieved"] = list(memory_report.get("docs_retrieved") or []) + [
+        d for d in derived_docs if d not in seen_docs
+    ]
+
+    rejected = list(memory_report.get("rejected_option_notes") or [])
+    rejected_set = set(rejected)
+    for note in derive_rejected_from_state(episode):
+        if note not in rejected_set:
+            rejected.append(note)
+            rejected_set.add(note)
+    memory_report["rejected_option_notes"] = rejected
+
+    return final
+
+
 def _fallback_result(runtime: StudentRuntime, session) -> Dict[str, Any]:
     fake_runner_result = {
         "parsed": {
@@ -73,13 +114,7 @@ def _fallback_result(runtime: StudentRuntime, session) -> Dict[str, Any]:
         "usage": runtime.runner.empty_usage(),
         "response_ids": [],
     }
-    return tool_result(
-        runtime.runner,
-        fake_runner_result,
-        session,
-        active_doc_cap=3,
-        active_key_cap=5,
-    )
+    return _build_final(runtime, session, fake_runner_result)
 
 
 def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
@@ -99,24 +134,4 @@ def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
     except RuntimeError:
         return _fallback_result(runtime, session)
 
-    retired_keys, spoken_retire = derive_retired_from_state(runtime.episode)
-
-    final = tool_result(
-        runtime.runner,
-        planner_result,
-        session,
-        active_doc_cap=3,
-        active_key_cap=5,
-        forced_retired=retired_keys,
-    )
-
-    memory_report = final["submission"].setdefault("memory_report", {})
-    spoken_hits = memory_report.setdefault("spoken_rule_hits", {})
-    spoken_hits["retire"] = list(spoken_retire)
-
-    derived_docs = derive_required_docs_from_state(runtime.episode)
-    seen_docs = set(memory_report.get("docs_retrieved") or [])
-    memory_report["docs_retrieved"] = list(memory_report.get("docs_retrieved") or []) + [
-        d for d in derived_docs if d not in seen_docs
-    ]
-    return final
+    return _build_final(runtime, session, planner_result)

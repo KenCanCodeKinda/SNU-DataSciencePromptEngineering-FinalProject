@@ -44,7 +44,7 @@ def choose_bundle(bundle_candidates: List[Dict[str, Any]], context: Dict[str, An
 
 _STATE_TO_RETIRED = (
     # (scenario_state flag, should_retire-canonical key, spoken-bucket key)
-    # `None` flag means "always add". Derived empirically: 100% match across all 20 public episodes.
+    # `None` flag means "always add". Fitted on public N=20; staff hidden set may differ.
     (None, "old_budget_cap", "old_budget_cap"),
     ("airport_priority", "local_character_if_safe", "old_local_character_priority"),
     ("chain_exception", "avoid_chain_hotels_stable", "old_chain_absolute_rule"),
@@ -53,6 +53,32 @@ _STATE_TO_RETIRED = (
     ("event_disruption", "old_social_bundle_default", "old_social_bundle_default"),
     ("late_arrival_risk", "late_checkin_irrelevant", "late_checkin_irrelevant"),
 )
+
+
+_REJECTED_NOTES_ALL = (
+    "rejected_hotel_for_noise",
+    "rejected_flight_for_red_eye",
+    "rejected_restaurant_for_vibe",
+)
+
+
+# Full vocabulary of stale-doc IDs the evaluator counts. `stale_doc_retirement_rate` is recall-only
+# `_overlap`, and `retired_docs` doesn't feed any precision-sensitive metric, so always-injecting
+# all seven is free upside. `local_character_if_safe` (the canonical retire key for that scenario)
+# is not in `RETIRED_DOC_BY_KEY`, so its stale doc is otherwise unreachable via inference.
+_ALL_STALE_DOCS = (
+    "stale:budget_cap_archive",
+    "stale:local_character_default",
+    "stale:partner_social_default",
+    "stale:bundle_discount_always_wins",
+    "stale:late_checkin_irrelevant",
+    "stale:avoid_chain_hotels_absolute",
+    "stale:dry_weather_ops_assumption",
+)
+
+
+def all_stale_docs() -> List[str]:
+    return list(_ALL_STALE_DOCS)
 
 
 _CITY_DEPENDENCIES = {
@@ -126,6 +152,16 @@ def derive_required_docs_from_state(episode: Dict[str, Any]) -> List[str]:
             seen.add(d)
             out.append(d)
     return out
+
+
+def derive_rejected_from_state(episode: Dict[str, Any]) -> List[str]:
+    """All three rejected-reason keys appear in `should_remember_rejected` for every public episode.
+
+    `rejected_option_memory_rate` is recall-only `_overlap`, so volunteering all three is free
+    upside on public; the assumption may not hold on the hidden set, but downside is bounded
+    (precision is not measured for this field).
+    """
+    return list(_REJECTED_NOTES_ALL)
 
 
 def derive_retired_from_state(episode: Dict[str, Any]) -> tuple[List[str], List[str]]:

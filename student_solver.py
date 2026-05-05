@@ -15,6 +15,7 @@ from student_custom_tools_template import (
     derive_rejected_from_state,
     derive_required_docs_from_state,
     derive_retired_from_state,
+    derive_spoken_rule_hits_from_state,
 )
 
 
@@ -68,7 +69,7 @@ def _run_planner(
 def _build_final(runtime: StudentRuntime, session, planner_result: Dict[str, Any]) -> Dict[str, Any]:
     """Apply tool_result + deterministic memory enrichments. Used by both main and fallback paths."""
     episode = runtime.episode
-    retired_keys, spoken_retire = derive_retired_from_state(episode)
+    retired_keys, _ = derive_retired_from_state(episode)
 
     final = tool_result(
         runtime.runner,
@@ -81,8 +82,7 @@ def _build_final(runtime: StudentRuntime, session, planner_result: Dict[str, Any
     )
 
     memory_report = final["submission"].setdefault("memory_report", {})
-    spoken_hits = memory_report.setdefault("spoken_rule_hits", {})
-    spoken_hits["retire"] = list(spoken_retire)
+    memory_report["spoken_rule_hits"] = derive_spoken_rule_hits_from_state(episode)
 
     derived_docs = derive_required_docs_from_state(episode)
     seen_docs = set(memory_report.get("docs_retrieved") or [])

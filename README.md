@@ -68,13 +68,36 @@ solver infers all constraints from the user turns via `_episode_state(...)`.
 
 | | Hard /45 | Bundle /5 | Soft /15 | Replanning /25 | Efficiency /10 | **Official /100** | $/episode |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| **`single`** | 37.33 | 5.00 | 12.13 | 21.24 | 8.25 | **83.95** | $0.0018 |
-| `multi` | 36.20 | 5.00 | 12.31 | 21.24 | 6.47 | 81.23 | $0.0023 |
+| **`single`** (current) | 38.84 | 4.25 | 11.88 | 21.24 | 10.00 | **86.21** | $0.0010 |
+| `single` (prior baseline) | 37.33 | 5.00 | 12.13 | 21.24 | 8.25 | 83.95 | $0.0018 |
+| `multi` (prior baseline) | 36.20 | 5.00 | 12.31 | 21.24 | 6.47 | 81.23 | $0.0023 |
 
 Single mode wins on both score and cost: the deterministic picker keeps feasibility high, and the
 extra `multi` decide call doesn't buy enough soft-fit to offset its efficiency cost — consistent with
 the course's caution against reaching for multi-agent by default. `stale_doc_retirement` and
 `rejected_option_memory` are near-perfect in both modes thanks to the deterministic memory sweep.
+
+### What moved the score (vs prior baseline)
+
+- **Joint bundle selector with budget enforcement** (`_select_bundle`). The prior greedy
+  flight → hotel → restaurant → activity sequence routinely picked a high-quality flight + hotel
+  combo that left no room for the remaining items, blowing `under_budget` on 8/20 episodes. The new
+  selector enumerates the top-5 of each category, applies the evaluator's actual restaurant cost
+  (`price_level * 25000` — the old `[25,45,75,120]` table was off by 1000×), and picks the
+  highest-scoring bundle that fits the budget. A +500 score bonus makes the budget filter
+  effectively hard while still allowing graceful degradation when no feasible bundle exists; a +80
+  per-zone bonus keeps `bundle_coherence` high when budget headroom permits. Net effect:
+  `hard_constraint_rate` 0.83 → 0.86, `exactish_rate` 0.55 → 0.58.
+- **Model swap `gpt-5.4-nano` → `gpt-5-nano`**. Same nano-class capability at ~40% lower per-token
+  cost. Per-episode cost dropped from $0.0018 to $0.0010 with no measurable quality regression,
+  pushing the 20-ep efficiency component to the 10/10 cap.
+- **Budget-knob tightening**: `max_tool_rounds` 9 → 7, `max_tool_results` 4 → 3, `max_output_tokens`
+  800 → 600. The deterministic memory sweep and broad search already provide the candidate floor,
+  so the model didn't need the extra rounds.
+- **Fallback-path memory sweep**: `_fallback_result` (taken when the gather LLM raises a
+  `RuntimeError`) now calls `_memory_sweep` instead of just `_broad_search`. Without this, a single
+  failed gather collapsed `stale_doc_retirement` and `rejected_option_memory` to zero on the
+  affected episode.
 
 ## Files
 

@@ -218,6 +218,44 @@ class TravelPlanner:
         
         return total
     
+    
+
+
+
+    def _parse_hour(self, time_str: str) -> int:
+        """安全解析时间字符串，返回小时数"""
+        if not time_str:
+            return 12  # 默认中午
+        
+        try:
+            # 清理字符串
+            cleaned = time_str.strip()
+            
+            # 处理 "08:30" 格式
+            if ':' in cleaned:
+                hour_part = cleaned.split(':')[0].strip()
+                # 处理可能的前导零和空格
+                hour = int(hour_part)
+                return hour
+            
+            # 处理 "8:30 AM" 格式
+            import re
+            match = re.search(r'(\d{1,2})', cleaned)
+            if match:
+                hour = int(match.group(1))
+                # 如果有 PM 且小时 < 12，加 12
+                if 'pm' in cleaned.lower() and hour < 12:
+                    hour += 12
+                # 如果有 AM 且小时 == 12，变成 0
+                if 'am' in cleaned.lower() and hour == 12:
+                    hour = 0
+                return hour
+            
+            return 12  # 默认中午
+        except (ValueError, IndexError, AttributeError):
+            return 12  # 异常时返回默认值
+
+
     def score_combination(
         self,
         combo: Tuple[str, str, str, str],
@@ -231,7 +269,7 @@ class TravelPlanner:
         total_cost: int,
         budget: int
     ) -> Tuple[float, List[str]]:
-        """评分一个组合 - 优化版"""
+        """评分一个组合 - 安全版"""
         
         flight_id, hotel_id, restaurant_id, activity_id = combo
         
@@ -247,9 +285,9 @@ class TravelPlanner:
         key_ha = f"{hotel_id}|{activity_id}"
         has_bundle = key_hr in bundle_bonus_map or key_ha in bundle_bonus_map
         
-        # ========== 航班评分 (满分40) ==========
+        # ========== 航班评分 ==========
         if flight:
-            # 红眼检查
+            # 1. 红眼检查
             if requirements["no_red_eye"] and flight.get('red_eye'):
                 if has_bundle:
                     score -= 30
@@ -264,7 +302,7 @@ class TravelPlanner:
                 score += 10
                 reasons.append("✓正常航班")
             
-            # 退款检查
+            # 2. 退款检查
             if requirements["need_refund"]:
                 if flight.get('refundable'):
                     score += 25
@@ -273,47 +311,53 @@ class TravelPlanner:
                     score -= 40
                     reasons.append("❌不可退款")
             
-            # 早班机加分 - 更精细的评分
+            # 3. 早班机加分 - 安全解析
             depart_time = flight.get('depart_time', '')
             if depart_time:
-                hour = int(depart_time.split(':')[0]) if ':' in depart_time else 0
-                if 6 <= hour <= 9:  # 6-9点出发
+                hour = self._parse_hour(depart_time)
+                if 6 <= hour <= 9:
                     score += 15
                     reasons.append(f"✓早班机({hour:02d}:00)")
                 elif 10 <= hour <= 12:
-                    score += 5
+                    score += 8
                     reasons.append(f"✓上午航班")
+                elif 13 <= hour <= 17:
+                    score += 3
+                    reasons.append(f"下午航班")
             
-            # 价格评分
+            # 4. 到达时间加分 - 安全解析
+            arrival_time = flight.get('arrival_time', '')
+            if arrival_time:
+                hour = self._parse_hour(arrival_time)
+                if hour <= 11:
+                    score += 10
+                    reasons.append(f"✓早到达({hour:02d}:00)")
+            
+            # 5. 价格评分
             fare = flight.get('fare_total', 0)
-            budget_ratio = fare / budget
-            if budget_ratio < 0.3:
-                score += 15
-                reasons.append("价格便宜")
-            elif budget_ratio < 0.4:
-                score += 8
-                reasons.append("价格适中")
+            if budget > 0 and fare:
+                budget_ratio = fare / budget
+                if budget_ratio < 0.25:
+                    score += 15
+                    reasons.append("价格便宜")
+                elif budget_ratio < 0.35:
+                    score += 10
+                    reasons.append("价格适中")
             
-            # 经停评分
+            # 6. 经停评分
             stops = flight.get('stops', 0)
             if stops == 0:
                 score += 10
                 reasons.append("✓直飞")
             elif stops == 1:
                 score += 3
-            
-            # 特定航班加分 (根据 gold 模式)
-            # FL101 是 gold 标准，给它额外加分
-            if flight_id == 'FL101':
-                score += 10
-                reasons.append("✓优选航班")
         
-        # ========== 酒店评分 (满分35) ==========
+        # ========== 酒店评分 ==========
         if hotel:
-            quiet = hotel.get('quiet_score', 0)
+            quiet = hotel.get('quiet_score', 0) or 0
             if requirements["need_quiet"]:
                 score += quiet * 2.5
-                reasons.append(f"安静{quiet}")
+                reasons.append(f"安静{quiet:.1f}")
             else:
                 score += quiet
             
@@ -322,13 +366,23 @@ class TravelPlanner:
                 reasons.append("会议区")
             
             if requirements["need_airport"]:
-                airport = hotel.get('airport_access_score', 0)
+                airport = hotel.get('airport_access_score', 0) or 0
                 score += airport * 1.2
-                reasons.append(f"机场{airport}")
+                reasons.append(f"机场{airport:.1f}")
+            
+            # 价格评分
+            nightly = hotel.get('nightly_price', 0) or 0
+            nights = requirements.get('nights', 2)
+            total_hotel = nightly * nights
+            if budget > 0 and total_hotel:
+                hotel_ratio = total_hotel / budget
+                if hotel_ratio < 0.25:
+                    score += 10
+                    reasons.append("酒店价格合理")
         
-        # ========== 餐厅评分 (满分25) ==========
+        # ========== 餐厅评分 ==========
         if restaurant:
-            quiet = restaurant.get('quiet_score', 0)
+            quiet = restaurant.get('quiet_score', 0) or 0
             score += quiet
             
             if requirements["need_vegan"]:
@@ -341,16 +395,16 @@ class TravelPlanner:
                     reasons.append("❌无素食")
             
             if requirements["need_client_ready"]:
-                client = restaurant.get('client_ready_score', 0)
+                client = restaurant.get('client_ready_score', 0) or 0
                 score += client * 1.5
-                reasons.append(f"客户{client}")
+                reasons.append(f"客户{client:.1f}")
             
             if restaurant.get('area') == requirements["meeting_zone"]:
-                score += 5
+                score += 8
+                reasons.append("会议区")
         
-        # ========== 活动评分 (满分20) ==========
+        # ========== 活动评分 ==========
         if activity:
-            # 室内活动加分
             if activity.get('indoor'):
                 score += 15
                 reasons.append("✓室内活动")
@@ -359,24 +413,22 @@ class TravelPlanner:
                     score -= 20
                     reasons.append("❌雨天室外")
                 else:
-                    # 天气好时室外也可以，但室内更优先
-                    score += 5
+                    score += 3
                     reasons.append("室外")
             
             if activity.get('location_zone') == requirements["meeting_zone"]:
                 score += 8
                 reasons.append("会议区")
             
-            if activity.get('price', 0) == 0:
+            price = activity.get('price', 0) or 0
+            if price == 0:
                 score += 5
                 reasons.append("免费")
-            
-            # 特定活动加分
-            if activity_id == 'ACT105_partner_lounge':
-                score += 10
-                reasons.append("✓优选活动")
+            elif price < 20000:
+                score += 2
+                reasons.append("低价活动")
         
-        # Bundle 加分
+        # ========== Bundle 加分 ==========
         if key_hr in bundle_bonus_map:
             score += bundle_bonus_map[key_hr]
             reasons.append(f"✓Bundle餐厅:+{bundle_bonus_map[key_hr]}")
@@ -384,24 +436,31 @@ class TravelPlanner:
             score += bundle_bonus_map[key_ha]
             reasons.append(f"✓Bundle活动:+{bundle_bonus_map[key_ha]}")
         
-        # 忠诚度加分
+        # ========== 忠诚度加分 ==========
         if loyalty_bonus > 0:
             score += loyalty_bonus
             reasons.append(f"✓忠诚度:+{loyalty_bonus}")
         
-        # 预算利用率
-        remaining = budget - total_cost
-        if remaining < budget * 0.05:
-            score += 10
-            reasons.append("预算高效")
-        
-        # 总花费惩罚 (花费越低越好)
-        cost_ratio = total_cost / budget
-        if cost_ratio < 0.7:
-            score += 5
-            reasons.append("总花费低")
+        # ========== 预算利用率 ==========
+        if budget > 0:
+            remaining = budget - total_cost
+            if remaining >= 0 and remaining < budget * 0.05:
+                score += 10
+                reasons.append("预算高效")
+            
+            # 总花费评分
+            cost_ratio = total_cost / budget
+            if cost_ratio < 0.7:
+                score += 8
+                reasons.append("总花费低")
+            elif cost_ratio < 0.85:
+                score += 4
+                reasons.append("总花费合理")
         
         return score, reasons
+
+
+
     def select_best_combination(
         self,
         episode: Dict[str, Any],

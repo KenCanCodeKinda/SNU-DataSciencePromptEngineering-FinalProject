@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Tuple
 from itertools import product
 
@@ -12,18 +13,42 @@ from student_custom_tools_template import (
     get_loyalty_bonus,
     filter_by_bundle,
     extract_user_requirements,
+    extract_spoken_rules_from_turns,
     build_memory_report_from_context,
 )
 
 
 class TravelPlanner:
-    """基于 scenario_state 过滤 + 规则评分 + 工具调用获取 bundle 信息的旅行规划器"""
+    """Scenario-based travel planner with LLM pairwise selection using preference hierarchy"""
     
     def __init__(self, runtime: StudentRuntime):
         self.runtime = runtime
-        
+    
+    def _parse_hour(self, time_str: str) -> int:
+        """Safely parse time string, return hour"""
+        if not time_str:
+            return 12
+        try:
+            cleaned = time_str.strip()
+            if ':' in cleaned:
+                hour_part = cleaned.split(':')[0].strip()
+                hour = int(hour_part)
+                return hour
+            import re
+            match = re.search(r'(\d{1,2})', cleaned)
+            if match:
+                hour = int(match.group(1))
+                if 'pm' in cleaned.lower() and hour < 12:
+                    hour += 12
+                if 'am' in cleaned.lower() and hour == 12:
+                    hour = 0
+                return hour
+            return 12
+        except (ValueError, IndexError, AttributeError):
+            return 12
+    
     def fetch_all_options(self, episode: Dict[str, Any]) -> Dict[str, List[Dict]]:
-        """获取所有可用选项"""
+        """Fetch all available options"""
         city = episode['city']
         origin = episode['origin']
         
@@ -45,36 +70,36 @@ class TravelPlanner:
         }
     
     def display_options(self, options: Dict[str, List[Dict]], episode: Dict[str, Any]) -> None:
-        """显示所有选项"""
+        """Display all options"""
         print("\n" + "="*80)
-        print(f"📋 Episode: {episode.get('trip_id')} - 所有可用选项")
+        print(f"📋 Episode: {episode.get('trip_id')} - All Available Options")
         print("="*80)
         
-        print(f"\n✈️ 航班 ({len(options['flights'])} 个):")
+        print(f"\n✈️ Flights ({len(options['flights'])}):")
         for f in options['flights']:
-            red_eye_flag = "🛑红眼" if f.get('red_eye') else "✓正常"
-            refund_flag = "🔄可退款" if f.get('refundable') else "❌不可退款"
+            red_eye_flag = "🛑Red-eye" if f.get('red_eye') else "✓Normal"
+            refund_flag = "🔄Refundable" if f.get('refundable') else "❌Non-refund"
             print(f"  - {f.get('flight_id')}: {f.get('depart_time', 'N/A')} → {f.get('arrival_time', 'N/A')}, "
-                  f"${f.get('fare_total', 'N/A'):,}, {red_eye_flag}, {refund_flag}")
+                  f"₩{f.get('fare_total', 'N/A'):,}, {red_eye_flag}, {refund_flag}")
         
-        print(f"\n🏨 酒店 ({len(options['hotels'])} 个):")
+        print(f"\n🏨 Hotels ({len(options['hotels'])}):")
         for h in options['hotels']:
-            chain_flag = "🏢连锁" if h.get('chain') else "🏨独立"
-            print(f"  - {h.get('hotel_id')}: {h.get('zone', 'N/A')}, ${h.get('nightly_price', 'N/A'):,}/晚, "
-                  f"安静分:{h.get('quiet_score', 0):.1f}, 机场分:{h.get('airport_access_score', 0):.1f}")
+            chain_flag = "🏢Chain" if h.get('chain') else "🏨Independent"
+            print(f"  - {h.get('hotel_id')}: {h.get('zone', 'N/A')}, ₩{h.get('nightly_price', 'N/A'):,}/night, "
+                  f"Quiet:{h.get('quiet_score', 0):.1f}, Airport:{h.get('airport_access_score', 0):.1f}, {chain_flag}")
         
-        print(f"\n🍽️ 餐厅 ({len(options['restaurants'])} 个):")
+        print(f"\n🍽️ Restaurants ({len(options['restaurants'])}):")
         for r in options['restaurants']:
-            dietary = ", ".join(r.get('dietary_flags', [])) if r.get('dietary_flags') else "无特殊"
+            dietary = ", ".join(r.get('dietary_flags', [])) if r.get('dietary_flags') else "None"
             print(f"  - {r.get('restaurant_id')}: {r.get('area', 'N/A')}, {r.get('cuisine', 'N/A')}, "
-                  f"价格等级:{r.get('price_level', 'N/A')}, 安静分:{r.get('quiet_score', 0):.1f}, "
-                  f"客户分:{r.get('client_ready_score', 0):.1f}")
+                  f"Price Level:{r.get('price_level', 'N/A')}, Quiet:{r.get('quiet_score', 0):.1f}, "
+                  f"Client:{r.get('client_ready_score', 0):.1f}, Diet:{dietary}")
         
-        print(f"\n🎯 活动 ({len(options['activities'])} 个):")
+        print(f"\n🎯 Activities ({len(options['activities'])}):")
         for a in options['activities']:
-            indoor_flag = "🏠室内" if a.get('indoor') else "🌳室外"
+            indoor_flag = "🏠Indoor" if a.get('indoor') else "🌳Outdoor"
             print(f"  - {a.get('activity_id')}: {a.get('location_zone', 'N/A')}, "
-                  f"${a.get('price', 0):,}, {indoor_flag}")
+                  f"₩{a.get('price', 0):,}, {indoor_flag}")
     
     def filter_by_scenario_state(
         self, 
@@ -82,21 +107,21 @@ class TravelPlanner:
         state: Dict[str, Any],
         episode: Dict[str, Any]
     ) -> Dict[str, List[Dict]]:
-        """根据 scenario_state 过滤"""
+        """Filter by scenario_state"""
         
         meeting_zone = episode.get('meeting_zone')
         budget = episode.get('budget_total', float('inf'))
         nights = episode.get('nights', 2)
         
         print("\n" + "="*80)
-        print("🔍 根据 scenario_state 过滤")
+        print("🔍 Filtering by scenario_state")
         print("="*80)
         
         active_filters = []
         for key, value in state.items():
             if value and key not in ['stakeholder_ids']:
                 active_filters.append(f"{key}: {value}")
-        print(f"  活跃过滤条件: {', '.join(active_filters)}")
+        print(f"  Active filters: {', '.join(active_filters)}")
         
         result = {
             "flights": options['flights'].copy(),
@@ -105,59 +130,58 @@ class TravelPlanner:
             "activities": options['activities'].copy(),
         }
         
-        # 航班：预算过滤
+        # Flights: budget filter
         original = len(result['flights'])
         result['flights'] = [f for f in result['flights'] if f.get('fare_total', float('inf')) <= budget]
         if original > len(result['flights']):
-            print(f"✈️ 预算过滤: {original} → {len(result['flights'])}")
+            print(f"✈️ Budget filter: {original} → {len(result['flights'])}")
         
-        # 酒店：会议区 + 预算 + 安静分
+        # Hotels: meeting zone + budget + quiet
         if meeting_zone:
             meeting_hotels = [h for h in result['hotels'] if h.get('zone') == meeting_zone]
             if meeting_hotels:
                 result['hotels'] = meeting_hotels
-                print(f"🏨 会议区过滤: 仅保留 {meeting_zone} 区 → {len(result['hotels'])}")
+                print(f"🏨 Meeting zone filter: keep {meeting_zone} → {len(result['hotels'])}")
         
         original = len(result['hotels'])
         result['hotels'] = [h for h in result['hotels'] if h.get('nightly_price', float('inf')) * nights <= budget]
         if original > len(result['hotels']):
-            print(f"🏨 预算过滤: {original} → {len(result['hotels'])}")
+            print(f"🏨 Budget filter: {original} → {len(result['hotels'])}")
         
-        # 安静分过滤
         original = len(result['hotels'])
         result['hotels'] = [h for h in result['hotels'] if h.get('quiet_score', 0) >= 7.0]
         if original > len(result['hotels']):
-            print(f"🏨 安静过滤: 仅保留安静分≥7.0 → {len(result['hotels'])}")
+            print(f"🏨 Quiet filter: keep quiet_score>=7.0 → {len(result['hotels'])}")
         
         if state.get('airport_priority'):
             result['hotels'] = sorted(result['hotels'], key=lambda h: (-h.get('airport_access_score', 0), h.get('nightly_price', float('inf'))))
-            print(f"🏨 机场优先: 按机场访问分排序")
+            print(f"🏨 Airport priority: sort by airport access score")
         
-        # 餐厅：会议区 + 素食
+        # Restaurants: meeting zone + vegan
         if meeting_zone:
             meeting_restaurants = [r for r in result['restaurants'] if r.get('area') == meeting_zone]
             if meeting_restaurants:
                 result['restaurants'] = meeting_restaurants
-                print(f"🍽️ 会议区过滤: 仅保留 {meeting_zone} 区 → {len(result['restaurants'])}")
+                print(f"🍽️ Meeting zone filter: keep {meeting_zone} → {len(result['restaurants'])}")
         
         if state.get('teammate_vegan'):
             vegan_restaurants = [r for r in result['restaurants'] if 'vegan' in r.get('dietary_flags', [])]
             if vegan_restaurants:
                 result['restaurants'] = vegan_restaurants
-                print(f"🍽️ 素食过滤: 仅保留有素食选项的餐厅 → {len(result['restaurants'])}")
+                print(f"🍽️ Vegan filter: keep vegan options → {len(result['restaurants'])}")
         
-        # 活动：会议区 + 雨天室内
+        # Activities: meeting zone + rainy indoor
         if meeting_zone:
             meeting_activities = [a for a in result['activities'] if a.get('location_zone') == meeting_zone]
             if meeting_activities:
                 result['activities'] = meeting_activities
-                print(f"🎯 会议区过滤: 仅保留 {meeting_zone} 区 → {len(result['activities'])}")
+                print(f"🎯 Meeting zone filter: keep {meeting_zone} → {len(result['activities'])}")
         
         if state.get('rainy'):
             indoor_activities = [a for a in result['activities'] if a.get('indoor')]
             if indoor_activities:
                 result['activities'] = indoor_activities
-                print(f"🎯 雨天过滤: 仅保留室内活动 → {len(result['activities'])}")
+                print(f"🎯 Rainy filter: keep indoor activities → {len(result['activities'])}")
         
         return result
     
@@ -165,7 +189,7 @@ class TravelPlanner:
         self, 
         filtered_options: Dict[str, List[Dict]]
     ) -> List[Tuple[str, str, str, str]]:
-        """生成所有组合"""
+        """Generate all combinations"""
         
         flights = [f.get('flight_id') for f in filtered_options['flights']]
         hotels = [h.get('hotel_id') for h in filtered_options['hotels']]
@@ -194,7 +218,7 @@ class TravelPlanner:
         activities_dict: Dict,
         nights: int
     ) -> int:
-        """计算组合总花费"""
+        """Calculate total cost of a combination"""
         
         flight_id, hotel_id, restaurant_id, activity_id = combo
         
@@ -218,258 +242,451 @@ class TravelPlanner:
         
         return total
     
-    
+    def generate_memory_report_with_llm(
+        self,
+        episode: Dict[str, Any],
+        best_combo: Tuple[str, str, str, str],
+        best_info: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Generate memory_report using LLM based on conversation"""
+        
+        turns = episode.get('turns', [])
+        flight_id, hotel_id, restaurant_id, activity_id = best_combo
+        
+        # Build conversation with timestamps
+        conversation_lines = []
+        for i, turn in enumerate(turns, 1):
+            speaker = "User" if turn.get('speaker') == 'user' else "System"
+            text = turn.get('text', '')
+            conversation_lines.append(f"[Message {i}] {speaker}: {text}")
+        conversation = "\n".join(conversation_lines)
+        
+        memory_prompt = f"""
+## User Conversation (chronological order)
+{conversation}
 
+## Selected Plan
+- Flight: {flight_id}
+- Hotel: {hotel_id}
+- Restaurant: {restaurant_id}
+- Activity: {activity_id}
 
+## Your Task
+Extract spoken rules from the conversation into the exact memory_report format required.
 
-    def _parse_hour(self, time_str: str) -> int:
-        """安全解析时间字符串，返回小时数"""
-        if not time_str:
-            return 12  # 默认中午
+## Rule Mapping Guide
+
+| User says | Category | Key to add |
+|-----------|----------|------------|
+| "quiet room matters", "genuinely quiet room" | must_remember | "quiet_matters" |
+| "client dinner polished", "polished enough for conversation" | must_remember | "client_ready_dinner" |
+| "no red-eye", "do not send me through a red-eye" | forbidden | "red_eye" |
+| "loud after 10pm", "nightlife spillover" | forbidden | "loud_after_10pm" |
+| "airport access matters more this trip only", "For this trip only, airport access matters more" | one_off_only | "airport_access_more_important_now" |
+| "chain hotel acceptable this trip only", "This trip only, a chain hotel is acceptable" | one_off_only | "chain_ok_this_trip" |
+| "older budget assumption no longer valid", "retire it", "The older budget assumption is no longer valid" | retire | "old_budget_cap" |
+| "stop carrying old local-character preference", "stop carrying the old local-character preference" | retire | "local_character_if_safe" |
+| "old chain absolute rule" | retire | "avoid_chain_hotels_stable" |
+| "old social bundle default" | retire | "old_social_bundle_default" |
+| "keep active context lean", "relevant old preferences", "bring back only the relevant old preferences" | keep_context_lean | "relevant_only" |
+| "reject hotel for noise, do not reconsider" | do_not_reconsider | "noise_rejected_hotel" |
+| "dinner option out for wrong vibe" | do_not_reconsider | "wrong_vibe_restaurant" |
+
+## Output Format (MUST follow exactly)
+
+Return JSON:
+{{
+  "memory_report": {{
+    "retrieved": ["prefer_quiet_hotel", "avoid_red_eye", "loud_after_10pm", "prefer_airport_access"],
+    "retired": ["old_budget_cap", "local_character_if_safe"],
+    "retired_docs": ["stale:budget_cap_archive", "stale:local_character_default"],
+    "rejected_option_notes": [],
+    "active_context_keys": ["prefer_quiet_hotel", "avoid_red_eye", "loud_after_10pm", "prefer_airport_access"],
+    "docs_retrieved": ["profile:traveler_ops", "city_ops:OSA"],
+    "active_docs": ["profile:traveler_ops"],
+    "ignored_distractors": [],
+    "spoken_rule_hits": {{
+      "must_remember": ["quiet_matters", "client_ready_dinner"],
+      "forbidden": ["red_eye", "loud_after_10pm"],
+      "one_off_only": ["airport_access_more_important_now", "chain_ok_this_trip"],
+      "retire": ["old_budget_cap", "local_character_if_safe"],
+      "do_not_reconsider": ["noise_rejected_hotel", "wrong_vibe_restaurant"],
+      "keep_context_lean": ["relevant_only"]
+    }}
+  }}
+}}
+
+## Important Rules
+1. ALWAYS include "relevant_only" in keep_context_lean
+2. If user says something is "this trip only", put it in one_off_only
+3. If user says something is "no longer valid" or "retire", put it in retire
+4. If user explicitly forbids something (like "do not send me through a red-eye"), put it in forbidden
+5. If user emphasizes something is important (like "quiet room matters"), put it in must_remember
+6. Use ONLY the key names from the mapping guide above
+
+Return ONLY valid JSON matching the exact format.
+"""
+        
+        memory_schema = {
+            "type": "object",
+            "properties": {
+                "memory_report": {
+                    "type": "object",
+                    "properties": {
+                        "retrieved": {"type": "array", "items": {"type": "string"}},
+                        "retired": {"type": "array", "items": {"type": "string"}},
+                        "retired_docs": {"type": "array", "items": {"type": "string"}},
+                        "rejected_option_notes": {"type": "array", "items": {"type": "string"}},
+                        "active_context_keys": {"type": "array", "items": {"type": "string"}},
+                        "docs_retrieved": {"type": "array", "items": {"type": "string"}},
+                        "active_docs": {"type": "array", "items": {"type": "string"}},
+                        "ignored_distractors": {"type": "array", "items": {"type": "string"}},
+                        "spoken_rule_hits": {
+                            "type": "object",
+                            "properties": {
+                                "must_remember": {"type": "array", "items": {"type": "string"}},
+                                "forbidden": {"type": "array", "items": {"type": "string"}},
+                                "one_off_only": {"type": "array", "items": {"type": "string"}},
+                                "retire": {"type": "array", "items": {"type": "string"}},
+                                "do_not_reconsider": {"type": "array", "items": {"type": "string"}},
+                                "keep_context_lean": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["must_remember", "forbidden", "one_off_only", "retire", "do_not_reconsider", "keep_context_lean"]
+                        }
+                    },
+                    "required": ["retrieved", "retired", "retired_docs", "rejected_option_notes", 
+                                 "active_context_keys", "docs_retrieved", "active_docs", 
+                                 "ignored_distractors", "spoken_rule_hits"]
+                }
+            },
+            "required": ["memory_report"]
+        }
+        
+        print(f"\n🤖 Stage 3: LLM Generating Memory Report")
         
         try:
-            # 清理字符串
-            cleaned = time_str.strip()
+            memory_result = self.runtime.runner.create_json_response(
+                model="gpt-4o-mini",
+                instructions="Extract spoken rules from conversation into exact memory_report format. Follow the mapping guide exactly.",
+                input_text=memory_prompt,
+                json_schema=memory_schema,
+                schema_name="memory_report",
+                max_output_tokens=1000,
+                metadata={"system": "student_solver", "trip_id": episode["trip_id"], "stage": "memory"},
+            )
             
-            # 处理 "08:30" 格式
-            if ':' in cleaned:
-                hour_part = cleaned.split(':')[0].strip()
-                # 处理可能的前导零和空格
-                hour = int(hour_part)
-                return hour
+            memory_report = memory_result.get("parsed", {}).get("memory_report", {})
             
-            # 处理 "8:30 AM" 格式
-            import re
-            match = re.search(r'(\d{1,2})', cleaned)
-            if match:
-                hour = int(match.group(1))
-                # 如果有 PM 且小时 < 12，加 12
-                if 'pm' in cleaned.lower() and hour < 12:
-                    hour += 12
-                # 如果有 AM 且小时 == 12，变成 0
-                if 'am' in cleaned.lower() and hour == 12:
-                    hour = 0
-                return hour
+            # Track usage
+            if hasattr(self.runtime, 'runner'):
+                self.runtime.runner._record_observed_usage(memory_result.get('usage', {}))
             
-            return 12  # 默认中午
-        except (ValueError, IndexError, AttributeError):
-            return 12  # 异常时返回默认值
-
-
-    def score_combination(
+        except Exception as e:
+            print(f"   ⚠️ LLM memory generation failed: {e}")
+            memory_report = {}
+        
+        # Ensure required fields exist
+        if "spoken_rule_hits" not in memory_report:
+            memory_report["spoken_rule_hits"] = {
+                "must_remember": [],
+                "forbidden": [],
+                "one_off_only": [],
+                "retire": [],
+                "do_not_reconsider": [],
+                "keep_context_lean": ["relevant_only"]
+            }
+        
+        # Ensure keep_context_lean always has relevant_only
+        if "keep_context_lean" in memory_report["spoken_rule_hits"]:
+            if "relevant_only" not in memory_report["spoken_rule_hits"]["keep_context_lean"]:
+                memory_report["spoken_rule_hits"]["keep_context_lean"].append("relevant_only")
+        else:
+            memory_report["spoken_rule_hits"]["keep_context_lean"] = ["relevant_only"]
+        
+        # Ensure all spoken_rule_hits fields exist
+        for field in ["must_remember", "forbidden", "one_off_only", "retire", "do_not_reconsider", "keep_context_lean"]:
+            if field not in memory_report["spoken_rule_hits"]:
+                memory_report["spoken_rule_hits"][field] = []
+        
+        # Set default active_context_keys if empty
+        if not memory_report.get("active_context_keys"):
+            memory_report["active_context_keys"] = ["prefer_quiet_hotel", "avoid_red_eye", "relevant_only"]
+        
+        # Set default retrieved if empty
+        if not memory_report.get("retrieved"):
+            memory_report["retrieved"] = memory_report["active_context_keys"][:4]
+        
+        print(f"\n   📋 Generated Memory Report:")
+        print(f"      must_remember: {memory_report['spoken_rule_hits']['must_remember']}")
+        print(f"      forbidden: {memory_report['spoken_rule_hits']['forbidden']}")
+        print(f"      one_off_only: {memory_report['spoken_rule_hits']['one_off_only']}")
+        print(f"      retire: {memory_report['spoken_rule_hits']['retire']}")
+        print(f"      keep_context_lean: {memory_report['spoken_rule_hits']['keep_context_lean']}")
+        
+        return memory_report
+    
+    def llm_selection(
         self,
-        combo: Tuple[str, str, str, str],
+        episode: Dict[str, Any],
+        valid_combos: List[Dict],
         requirements: Dict[str, Any],
         flights_dict: Dict,
         hotels_dict: Dict,
         restaurants_dict: Dict,
-        activities_dict: Dict,
-        bundle_bonus_map: Dict[str, int],
-        loyalty_bonus: int,
-        total_cost: int,
-        budget: int
-    ) -> Tuple[float, List[str]]:
-        """评分一个组合 - 安全版"""
+        activities_dict: Dict
+    ) -> Tuple[Tuple[str, str, str, str], float, Dict, Dict]:
+        """Three-stage LLM selection: Filter -> Select -> Memory Report"""
         
-        flight_id, hotel_id, restaurant_id, activity_id = combo
+        turns = episode.get('turns', [])
         
-        flight = flights_dict.get(flight_id) if flight_id else None
-        hotel = hotels_dict.get(hotel_id) if hotel_id else None
-        restaurant = restaurants_dict.get(restaurant_id) if restaurant_id else None
-        activity = activities_dict.get(activity_id) if activity_id else None
+        # Build conversation with timestamps
+        conversation_lines = []
+        for i, turn in enumerate(turns, 1):
+            speaker = "User" if turn.get('speaker') == 'user' else "System"
+            text = turn.get('text', '')
+            conversation_lines.append(f"[Message {i}] {speaker}: {text}")
+        conversation = "\n".join(conversation_lines)
         
-        score = 0.0
-        reasons = []
-        
-        key_hr = f"{hotel_id}|{restaurant_id}"
-        key_ha = f"{hotel_id}|{activity_id}"
-        has_bundle = key_hr in bundle_bonus_map or key_ha in bundle_bonus_map
-        
-        # ========== 航班评分 ==========
-        if flight:
-            # 1. 红眼检查
-            if requirements["no_red_eye"] and flight.get('red_eye'):
-                if has_bundle:
-                    score -= 30
-                    reasons.append("⚠️红眼(有bundle)")
-                else:
-                    score -= 100
-                    reasons.append("❌红眼航班")
-            elif flight.get('red_eye'):
-                score -= 30
-                reasons.append("⚠️红眼")
-            else:
-                score += 10
-                reasons.append("✓正常航班")
+        # Build combo table with detailed info
+        combo_table = []
+        for i, item in enumerate(valid_combos, 1):
+            flight_id, hotel_id, restaurant_id, activity_id = item['combo']
             
-            # 2. 退款检查
-            if requirements["need_refund"]:
+            flight = flights_dict.get(flight_id)
+            hotel = hotels_dict.get(hotel_id)
+            restaurant = restaurants_dict.get(restaurant_id)
+            activity = activities_dict.get(activity_id)
+            
+            # Flight info
+            flight_info = f"{flight_id}"
+            if flight:
+                flight_info += f"({flight.get('depart_time', '?')}->{flight.get('arrival_time', '?')})"
+                if flight.get('red_eye'):
+                    flight_info += " RED-EYE"
+                    fare = flight.get('fare_total', 0)
+                    flight_info += f" {fare:,} won"
+                    # Check if significantly cheaper
+                    avg_fare = 450000
+                    if fare < avg_fare * 0.7:
+                        flight_info += " BIG SAVINGS"
+                else:
+                    flight_info += " NORMAL"
                 if flight.get('refundable'):
-                    score += 25
-                    reasons.append("✓可退款")
-                else:
-                    score -= 40
-                    reasons.append("❌不可退款")
+                    flight_info += " REFUND"
             
-            # 3. 早班机加分 - 安全解析
-            depart_time = flight.get('depart_time', '')
-            if depart_time:
-                hour = self._parse_hour(depart_time)
-                if 6 <= hour <= 9:
-                    score += 15
-                    reasons.append(f"✓早班机({hour:02d}:00)")
-                elif 10 <= hour <= 12:
-                    score += 8
-                    reasons.append(f"✓上午航班")
-                elif 13 <= hour <= 17:
-                    score += 3
-                    reasons.append(f"下午航班")
+            # Hotel info
+            hotel_info = f"{hotel_id}"
+            if hotel:
+                hotel_info += f"({hotel.get('zone', '?')} zone quiet:{hotel.get('quiet_score', 0):.1f})"
+                if hotel.get('zone') == episode.get('meeting_zone'):
+                    hotel_info += " MEETING ZONE"
             
-            # 4. 到达时间加分 - 安全解析
-            arrival_time = flight.get('arrival_time', '')
-            if arrival_time:
-                hour = self._parse_hour(arrival_time)
-                if hour <= 11:
-                    score += 10
-                    reasons.append(f"✓早到达({hour:02d}:00)")
+            # Restaurant info
+            rest_info = f"{restaurant_id}"
+            if restaurant:
+                rest_info += f"({restaurant.get('area', '?')} zone client:{restaurant.get('client_ready_score', 0):.1f})"
+                if 'vegan' in restaurant.get('dietary_flags', []):
+                    rest_info += " VEGAN"
             
-            # 5. 价格评分
-            fare = flight.get('fare_total', 0)
-            if budget > 0 and fare:
-                budget_ratio = fare / budget
-                if budget_ratio < 0.25:
-                    score += 15
-                    reasons.append("价格便宜")
-                elif budget_ratio < 0.35:
-                    score += 10
-                    reasons.append("价格适中")
+            # Activity info
+            act_info = f"{activity_id}"
+            if activity:
+                act_info += f"({activity.get('location_zone', '?')} zone {'INDOOR' if activity.get('indoor') else 'OUTDOOR'})"
             
-            # 6. 经停评分
-            stops = flight.get('stops', 0)
-            if stops == 0:
-                score += 10
-                reasons.append("✓直飞")
-            elif stops == 1:
-                score += 3
+            combo_table.append(f"{i}. {flight_info} | {hotel_info} | {rest_info} | {act_info} | {item['total_cost']:,} won")
         
-        # ========== 酒店评分 ==========
-        if hotel:
-            quiet = hotel.get('quiet_score', 0) or 0
-            if requirements["need_quiet"]:
-                score += quiet * 2.5
-                reasons.append(f"安静{quiet:.1f}")
+        # ========== Stage 1: Filter by Preference Hierarchy ==========
+        filter_prompt = f"""
+## User Conversation (chronological order, later messages override earlier)
+{conversation}
+
+## Candidate Combinations ({len(valid_combos)} total)
+{chr(10).join(combo_table)}
+
+## Preference Hierarchy (Highest to Lowest Priority)
+
+### Level 1 - HIGHEST (Must satisfy)
+- Meeting attendance: must arrive in time for the meeting/event
+- Functional for work: need to stay productive
+
+### Level 2 - HIGH (Satisfy unless overridden by Level 1)
+- **Red-eye flight rule**: User said "Do not send me through a red-eye just because the fare is lower"
+  - REJECT red-eye whose ONLY advantage is lower cost
+  - ACCEPT red-eye that is the ONLY way to attend the meeting
+  - CONSIDER red-eye with significant savings (e.g., 30%+ cheaper) and budget pressure
+
+### Level 3 - MEDIUM (Can be overridden by Level 2)
+- Local character (suppressed for this trip)
+- Chain hotel restriction (temporarily overridden by "this trip only")
+
+### Level 4 - RETIRED (No longer apply)
+- Old budget assumption (retired by user)
+
+## Your Task
+1. First, check if the user can attend the meeting on time (check flight arrival time)
+2. Then evaluate red-eye flights: reject only if the ONLY reason is cost savings
+3. Return the numbers of combinations that are ACCEPTABLE under this hierarchy
+
+Return JSON: {{"valid_combo_ids": [1,2,3], "reason": "filtering reason"}}
+"""
+        
+        filter_schema = {
+            "type": "object",
+            "properties": {
+                "valid_combo_ids": {"type": "array", "items": {"type": "integer"}},
+                "reason": {"type": "string"}
+            },
+            "required": ["valid_combo_ids", "reason"],
+            "additionalProperties": False
+        }
+        
+        print(f"\n🤖 Stage 1: LLM Hierarchy Filtering")
+        print(f"   Model: gpt-4o-mini")
+        print(f"   Candidates: {len(valid_combos)}")
+        
+        filter_result = self.runtime.runner.create_json_response(
+            model="gpt-4o-mini",
+            instructions="Apply the preference hierarchy. Return combo numbers that are acceptable.",
+            input_text=filter_prompt,
+            json_schema=filter_schema,
+            schema_name="filter_combos",
+            max_output_tokens=800,
+            metadata={"system": "student_solver", "trip_id": episode["trip_id"], "stage": "filter"},
+        )
+        
+        filter_parsed = filter_result.get("parsed", {})
+        valid_ids = filter_parsed.get("valid_combo_ids", [])
+        filter_reason = filter_parsed.get("reason", "")
+        
+        print(f"   After filter: {len(valid_ids)} combos")
+        print(f"   Reason: {filter_reason[:200]}")
+        
+        # Print filtered combos
+        if valid_ids:
+            print(f"\n   Filtered combinations:")
+            for idx in valid_ids[:10]:
+                if 1 <= idx <= len(valid_combos):
+                    item = valid_combos[idx - 1]
+                    flight_id, hotel_id, restaurant_id, activity_id = item['combo']
+                    print(f"      #{idx}: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id} | {item['total_cost']:,} won")
+            if len(valid_ids) > 10:
+                print(f"      ... and {len(valid_ids) - 10} more")
+        
+        # Get filtered combos
+        filtered_combos = []
+        for idx in valid_ids:
+            if 1 <= idx <= len(valid_combos):
+                filtered_combos.append(valid_combos[idx - 1])
+        
+        if not filtered_combos:
+            print(f"   No valid combos, using first 10")
+            filtered_combos = valid_combos[:10]
+        
+        if hasattr(self.runtime, 'runner'):
+            self.runtime.runner._record_observed_usage(filter_result.get('usage', {}))
+        
+        # ========== Stage 2: Select best from filtered combos ==========
+        if len(filtered_combos) == 1:
+            best_item = filtered_combos[0]
+            reason = filter_reason + " -> Only valid combination"
+        else:
+            filtered_table = []
+            for i, item in enumerate(filtered_combos, 1):
+                flight_id, hotel_id, restaurant_id, activity_id = item['combo']
+                flight = flights_dict.get(flight_id)
+                hotel = hotels_dict.get(hotel_id)
+                restaurant = restaurants_dict.get(restaurant_id)
+                activity = activities_dict.get(activity_id)
+                
+                flight_info = f"{flight_id}({flight.get('depart_time', '?')}->{flight.get('arrival_time', '?')})" if flight else flight_id
+                if flight and flight.get('red_eye'):
+                    flight_info += "R"
+                hotel_info = f"{hotel_id}(quiet:{hotel.get('quiet_score', 0):.1f})" if hotel else hotel_id
+                rest_info = f"{restaurant_id}(client:{restaurant.get('client_ready_score', 0):.1f})" if restaurant else restaurant_id
+                act_info = f"{activity_id}" + (" indoor" if activity and activity.get('indoor') else "") if activity else activity_id
+                
+                filtered_table.append(f"{i}. {flight_info} | {hotel_info} | {rest_info} | {act_info} | {item['total_cost']:,} won")
+            
+            print(f"\n   Stage 2 candidates:")
+            for line in filtered_table:
+                print(f"      {line}")
+            
+            select_prompt = f"""
+## User Conversation
+{conversation}
+
+## Valid Candidates ({len(filtered_combos)} combos)
+{chr(10).join(filtered_table)}
+
+## Task
+Select the combination that best meets the user's needs.
+Return JSON: {{"selected": number, "reason": "selection reason"}}
+"""
+            
+            select_schema = {
+                "type": "object",
+                "properties": {
+                    "selected": {"type": "integer"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["selected", "reason"],
+                "additionalProperties": False
+            }
+            
+            print(f"\n🤖 Stage 2: LLM Best Selection")
+            print(f"   Candidates: {len(filtered_combos)}")
+            
+            select_result = self.runtime.runner.create_json_response(
+                model="gpt-4o-mini",
+                instructions="Select the best combination that meets user needs.",
+                input_text=select_prompt,
+                json_schema=select_schema,
+                schema_name="select_best",
+                max_output_tokens=500,
+                metadata={"system": "student_solver", "trip_id": episode["trip_id"], "stage": "select"},
+            )
+            
+            select_parsed = select_result.get("parsed", {})
+            selected_idx = select_parsed.get("selected", 1) - 1
+            reason = select_parsed.get("reason", "")
+            
+            if 0 <= selected_idx < len(filtered_combos):
+                best_item = filtered_combos[selected_idx]
             else:
-                score += quiet
+                best_item = filtered_combos[0]
             
-            if hotel.get('zone') == requirements["meeting_zone"]:
-                score += 15
-                reasons.append("会议区")
-            
-            if requirements["need_airport"]:
-                airport = hotel.get('airport_access_score', 0) or 0
-                score += airport * 1.2
-                reasons.append(f"机场{airport:.1f}")
-            
-            # 价格评分
-            nightly = hotel.get('nightly_price', 0) or 0
-            nights = requirements.get('nights', 2)
-            total_hotel = nightly * nights
-            if budget > 0 and total_hotel:
-                hotel_ratio = total_hotel / budget
-                if hotel_ratio < 0.25:
-                    score += 10
-                    reasons.append("酒店价格合理")
+            if hasattr(self.runtime, 'runner'):
+                self.runtime.runner._record_observed_usage(select_result.get('usage', {}))
         
-        # ========== 餐厅评分 ==========
-        if restaurant:
-            quiet = restaurant.get('quiet_score', 0) or 0
-            score += quiet
-            
-            if requirements["need_vegan"]:
-                dietary = restaurant.get('dietary_flags', [])
-                if 'vegan' in dietary or 'vegan_preorder' in dietary:
-                    score += 20
-                    reasons.append("✓素食")
-                else:
-                    score -= 30
-                    reasons.append("❌无素食")
-            
-            if requirements["need_client_ready"]:
-                client = restaurant.get('client_ready_score', 0) or 0
-                score += client * 1.5
-                reasons.append(f"客户{client:.1f}")
-            
-            if restaurant.get('area') == requirements["meeting_zone"]:
-                score += 8
-                reasons.append("会议区")
+        flight_id, hotel_id, restaurant_id, activity_id = best_item['combo']
         
-        # ========== 活动评分 ==========
-        if activity:
-            if activity.get('indoor'):
-                score += 15
-                reasons.append("✓室内活动")
-            else:
-                if requirements["rainy"]:
-                    score -= 20
-                    reasons.append("❌雨天室外")
-                else:
-                    score += 3
-                    reasons.append("室外")
-            
-            if activity.get('location_zone') == requirements["meeting_zone"]:
-                score += 8
-                reasons.append("会议区")
-            
-            price = activity.get('price', 0) or 0
-            if price == 0:
-                score += 5
-                reasons.append("免费")
-            elif price < 20000:
-                score += 2
-                reasons.append("低价活动")
+        print(f"\nFinal selection: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
+        print(f"   Reason: {reason[:300]}")
         
-        # ========== Bundle 加分 ==========
-        if key_hr in bundle_bonus_map:
-            score += bundle_bonus_map[key_hr]
-            reasons.append(f"✓Bundle餐厅:+{bundle_bonus_map[key_hr]}")
-        if key_ha in bundle_bonus_map:
-            score += bundle_bonus_map[key_ha]
-            reasons.append(f"✓Bundle活动:+{bundle_bonus_map[key_ha]}")
+        best_info = {
+            'total_cost': best_item['total_cost'],
+            'reason': reason
+        }
         
-        # ========== 忠诚度加分 ==========
-        if loyalty_bonus > 0:
-            score += loyalty_bonus
-            reasons.append(f"✓忠诚度:+{loyalty_bonus}")
+        # ========== Stage 3: Generate Memory Report ==========
+        memory_report = self.generate_memory_report_with_llm(
+            episode, 
+            best_item['combo'], 
+            best_info
+        )
         
-        # ========== 预算利用率 ==========
-        if budget > 0:
-            remaining = budget - total_cost
-            if remaining >= 0 and remaining < budget * 0.05:
-                score += 10
-                reasons.append("预算高效")
-            
-            # 总花费评分
-            cost_ratio = total_cost / budget
-            if cost_ratio < 0.7:
-                score += 8
-                reasons.append("总花费低")
-            elif cost_ratio < 0.85:
-                score += 4
-                reasons.append("总花费合理")
-        
-        return score, reasons
-
-
-
+        return best_item['combo'], 0, best_info, memory_report
+    
     def select_best_combination(
         self,
         episode: Dict[str, Any],
         filtered_options: Dict[str, List[Dict]],
         combinations: List[Tuple[str, str, str, str]],
         context_info: Dict[str, Any],
-        requirements: Dict[str, Any]
-    ) -> Tuple[Tuple[str, str, str, str], float, Dict]:
-        """选择最佳组合"""
+        requirements: Dict[str, Any],
+        spoken_rules: Dict[str, List[str]]
+    ) -> Tuple[Tuple[str, str, str, str], float, Dict, Dict]:
+        """Select best combination using LLM with memory report generation"""
         
         budget = requirements["budget"]
         nights = requirements["nights"]
@@ -479,18 +696,15 @@ class TravelPlanner:
         restaurants_dict = {r.get('restaurant_id'): r for r in filtered_options['restaurants']}
         activities_dict = {a.get('activity_id'): a for a in filtered_options['activities']}
         
-        bundle_bonus_map = build_bundle_bonus_map(context_info)
-        loyalty_bonus = get_loyalty_bonus(context_info)
-        
         print("\n" + "="*80)
-        print("💰 计算每个组合的总花费")
+        print("Calculating total cost for each combination")
         print("="*80)
-        print(f"总预算: ${budget:,}")
-        print(f"住宿天数: {nights} 晚")
-        print(f"待评分组合: {len(combinations)} 个")
+        print(f"Total budget: {budget:,} won")
+        print(f"Number of nights: {nights}")
+        print(f"Total combos: {len(combinations)}")
         print("-" * 80)
         
-        scored_combos = []
+        valid_combos = []
         skipped = 0
         
         for combo in combinations:
@@ -502,54 +716,50 @@ class TravelPlanner:
                 skipped += 1
                 continue
             
-            score, reasons = self.score_combination(
-                combo, requirements, flights_dict, hotels_dict, restaurants_dict, activities_dict,
-                bundle_bonus_map, loyalty_bonus, total_cost, budget
-            )
-            
-            scored_combos.append({
+            valid_combos.append({
                 'combo': combo,
                 'total_cost': total_cost,
-                'score': score,
-                'reason': ", ".join(reasons[:5])
+                'score': 0,
             })
+            
+            flight_id, hotel_id, restaurant_id, activity_id = combo
+            print(f"  {flight_id} | {hotel_id} | {restaurant_id} | {activity_id} -> {total_cost:,} won")
         
-        print(f"  ✓ 预算内: {len(scored_combos)} 个")
-        print(f"  ✗ 超预算: {skipped} 个")
+        print(f"\n  Within budget: {len(valid_combos)}")
+        print(f"  Over budget: {skipped}")
         
-        if not scored_combos:
-            print("\n⚠️ 没有预算内的组合")
-            return (None, None, None, None), 0, {'total_cost': 0, 'reason': '无预算内组合'}
+        if not valid_combos:
+            print("\nNo combinations within budget")
+            empty_memory = {
+                "spoken_rule_hits": {
+                    "must_remember": [],
+                    "forbidden": [],
+                    "one_off_only": [],
+                    "retire": [],
+                    "do_not_reconsider": [],
+                    "keep_context_lean": ["relevant_only"]
+                },
+                "retrieved": [],
+                "retired": [],
+                "active_context_keys": ["relevant_only"]
+            }
+            return (None, None, None, None), 0, {'total_cost': 0, 'reason': 'No valid combos within budget'}, empty_memory
         
-        scored_combos.sort(key=lambda x: (-x['score'], x['total_cost']))
+        best_combo, best_score, best_info, memory_report = self.llm_selection(
+            episode, valid_combos, requirements,
+            flights_dict, hotels_dict, restaurants_dict, activities_dict
+        )
         
-        print("\n" + "="*80)
-        print("🏆 评分排名 (Top 15)")
-        print("="*80)
-        print(f"{'排名':<4} {'得分':<8} {'花费':<12} {'组合'}")
-        print("-" * 80)
+        flight_id, hotel_id, restaurant_id, activity_id = best_combo
         
-        for rank, item in enumerate(scored_combos[:15], 1):
-            flight_id, hotel_id, restaurant_id, activity_id = item['combo']
-            print(f"{rank:<4} {item['score']:<8.1f} ${item['total_cost']:<11,} {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
+        print(f"\nBest combo: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
+        print(f"   Cost: {best_info.get('total_cost', 0):,} won")
+        print(f"   Reason: {best_info.get('reason', '')[:200]}")
         
-        if len(scored_combos) > 15:
-            print(f"  ... 还有 {len(scored_combos) - 15} 个组合")
-        
-        best = scored_combos[0]
-        flight_id, hotel_id, restaurant_id, activity_id = best['combo']
-        print(f"\n📋 最佳组合: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
-        print(f"   得分: {best['score']:.1f}")
-        print(f"   花费: ${best['total_cost']:,}")
-        print(f"   理由: {best['reason']}")
-        
-        return best['combo'], best['score'], {
-            'total_cost': best['total_cost'],
-            'reason': best['reason']
-        }
+        return best_combo, best_score, best_info, memory_report
     
     def recommend(self, episode: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """为单个 episode 生成推荐"""
+        """Generate recommendation for a single episode"""
         
         state = episode.get('scenario_state', {})
         
@@ -559,15 +769,15 @@ class TravelPlanner:
         filtered_options = self.filter_by_scenario_state(all_options, state, episode)
         
         print("\n" + "="*80)
-        print("📊 Filtered Results")
+        print("Filtered Results")
         print("="*80)
-        print(f"✈️ Flights: {len(filtered_options['flights'])} -> {[f.get('flight_id') for f in filtered_options['flights']]}")
-        print(f"🏨 Hotels: {len(filtered_options['hotels'])} -> {[h.get('hotel_id') for h in filtered_options['hotels']]}")
-        print(f"🍽️ Restaurants: {len(filtered_options['restaurants'])} -> {[r.get('restaurant_id') for r in filtered_options['restaurants']]}")
-        print(f"🎯 Activities: {len(filtered_options['activities'])} -> {[a.get('activity_id') for a in filtered_options['activities']]}")
+        print(f"Flights: {len(filtered_options['flights'])} -> {[f.get('flight_id') for f in filtered_options['flights']]}")
+        print(f"Hotels: {len(filtered_options['hotels'])} -> {[h.get('hotel_id') for h in filtered_options['hotels']]}")
+        print(f"Restaurants: {len(filtered_options['restaurants'])} -> {[r.get('restaurant_id') for r in filtered_options['restaurants']]}")
+        print(f"Activities: {len(filtered_options['activities'])} -> {[a.get('activity_id') for a in filtered_options['activities']]}")
         
         combinations = self.generate_combinations(filtered_options)
-        print(f"\n📊 Total Combinations: {len(combinations)}")
+        print(f"\nTotal Combinations: {len(combinations)}")
         
         session = self.runtime.new_session(retrieval_strategy="lexical", max_results=10)
         context_info = fetch_all_context_info(session, episode)
@@ -577,12 +787,10 @@ class TravelPlanner:
         
         turns = episode.get('turns', [])
         requirements = extract_user_requirements(turns, state, episode)
+        spoken_rules = extract_spoken_rules_from_turns(episode)
         
-        if state.get('partner_bundle') or context_info.get("promotions") or context_info.get("dependencies"):
-            combinations = filter_by_bundle(combinations, context_info)
-        
-        best_combo, best_score, best_info = self.select_best_combination(
-            episode, filtered_options, combinations, context_info, requirements
+        best_combo, best_score, best_info, memory_report = self.select_best_combination(
+            episode, filtered_options, combinations, context_info, requirements, spoken_rules
         )
         
         flight_id, hotel_id, restaurant_id, activity_id = best_combo
@@ -592,41 +800,45 @@ class TravelPlanner:
             "hotel_id": hotel_id,
             "restaurant_id": restaurant_id,
             "activity_id": activity_id,
-            "notes": f"Score: {best_score:.1f} | {best_info.get('reason', '')[:150]}"
+            "notes": f"LLM selected: {best_info.get('reason', '')[:150]}"
         }
         
-        memory_report = build_memory_report_from_context(episode, context_info, requirements)
-        
         print("\n" + "="*80)
-        print("🏆 Final Recommendation")
+        print("Final Recommendation")
         print("="*80)
-        print(f"✈️ Flight: {flight_id}")
-        print(f"🏨 Hotel: {hotel_id}")
-        print(f"🍽️ Restaurant: {restaurant_id}")
-        print(f"🎯 Activity: {activity_id}")
-        print(f"💰 Total Cost: ${best_info.get('total_cost', 0):,}")
-        print(f"📊 Score: {best_score:.1f}")
+        print(f"Flight: {flight_id}")
+        print(f"Hotel: {hotel_id}")
+        print(f"Restaurant: {restaurant_id}")
+        print(f"Activity: {activity_id}")
+        print(f"Total Cost: {best_info.get('total_cost', 0):,} won")
+        
+        print("\nMemory Report:")
+        print(f"   must_remember: {memory_report.get('spoken_rule_hits', {}).get('must_remember', [])}")
+        print(f"   forbidden: {memory_report.get('spoken_rule_hits', {}).get('forbidden', [])}")
+        print(f"   one_off_only: {memory_report.get('spoken_rule_hits', {}).get('one_off_only', [])}")
+        print(f"   retire: {memory_report.get('spoken_rule_hits', {}).get('retire', [])}")
+        print(f"   keep_context_lean: {memory_report.get('spoken_rule_hits', {}).get('keep_context_lean', [])}")
         
         return picks, memory_report
 
 
 def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
-    """官方评估器调用的入口函数"""
+    """Official evaluator entry point"""
     
     episode = runtime.episode
     
     print("\n" + "="*80)
-    print(f"🎯 Processing Episode: {episode.get('trip_id')}")
+    print(f"Processing Episode: {episode.get('trip_id')}")
     print("="*80)
     print(f"City: {episode.get('city')}")
     print(f"Origin: {episode.get('origin')}")
     print(f"Meeting Zone: {episode.get('meeting_zone')}")
-    print(f"Budget: {episode.get('budget_total'):,}")
+    print(f"Budget: {episode.get('budget_total'):,} won")
     print(f"Weather: {episode.get('weather')}")
     print(f"Traveler: {episode.get('traveler_id')}")
     
     state = episode.get('scenario_state', {})
-    print(f"\n📌 Scenario State:")
+    print(f"\nScenario State:")
     for key, value in state.items():
         if value and key != 'stakeholder_ids':
             print(f"   - {key}: {value}")
@@ -634,7 +846,7 @@ def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
             print(f"   - {key}: {value}")
     
     turns = episode.get('turns', [])
-    print(f"\n💬 User Messages: {len(turns)}")
+    print(f"\nUser Messages: {len(turns)}")
     
     planner = TravelPlanner(runtime)
     picks, memory_report = planner.recommend(episode)
@@ -645,7 +857,7 @@ def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
         "restaurant_id": picks.get("restaurant_id"),
         "activity_id": picks.get("activity_id"),
         "memory_report": memory_report,
-        "notes": picks.get("notes", f"Rule-based selection for {episode.get('trip_id')}")
+        "notes": picks.get("notes", f"LLM selection for {episode.get('trip_id')}")
     }
     
     session = runtime.new_session(retrieval_strategy="lexical", max_results=4)
@@ -656,7 +868,7 @@ def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
         usage = runtime.combine_usages(usage, runtime.runner._usage_ledger)
     
     print("\n" + "="*80)
-    print("✅ Episode Complete")
+    print("Episode Complete")
     print("="*80 + "\n")
     
     return {

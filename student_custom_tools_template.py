@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-"""Student-owned helper module for tool calls and memory management."""
+"""Student-owned helper module for tool calls and memory management.
+
+完全动态发现机制 - 无硬编码，无盲猜兜底
+"""
 
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ============================================================
 
 def fetch_all_context_info(session, episode: Dict[str, Any]) -> Dict[str, Any]:
-    """通过工具调用获取所有需要的上下文信息"""
+    """通过工具调用获取所有需要的上下文信息 - 完全动态"""
     
     city = episode.get('city')
     state = episode.get('scenario_state', {})
@@ -154,10 +157,10 @@ def fetch_all_context_info(session, episode: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         print(f"  ✗ 获取 rejected options 失败: {e}")
     
-    # 11. 搜索 stale 文档 - 关键！用于 stale_doc_retirement
+    # 11. 搜索 stale 文档 - 完全动态，不硬编码
     try:
         stale_result = session.search_memory(
-            query="stale budget cap archive local character chain bundle discount",
+            query="stale outdated deprecated old assumption",
             include_stale=True,
             top_k=10
         )
@@ -174,7 +177,7 @@ def fetch_all_context_info(session, episode: Dict[str, Any]) -> Dict[str, Any]:
     # 12. 搜索相关 heuristics
     try:
         memory_result = session.search_memory(
-            query="heuristic lean context partner bundle rejected option",
+            query="heuristic policy rule constraint",
             include_stale=False,
             top_k=5
         )
@@ -193,7 +196,7 @@ def fetch_all_context_info(session, episode: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_bundle_bonus_map(context_info: Dict[str, Any]) -> Dict[str, int]:
-    """构建 bundle 加分映射"""
+    """构建 bundle 加分映射 - 基于工具调用获取的真实数据"""
     bonus_map = {}
     
     for promo in context_info.get("promotions", []):
@@ -226,7 +229,7 @@ def build_bundle_bonus_map(context_info: Dict[str, Any]) -> Dict[str, int]:
 
 
 def get_loyalty_bonus(context_info: Dict[str, Any]) -> int:
-    """获取忠诚度加分"""
+    """获取忠诚度加分 - 基于工具调用获取的真实数据"""
     loyalty = context_info.get("loyalty")
     if not loyalty:
         return 0
@@ -234,6 +237,7 @@ def get_loyalty_bonus(context_info: Dict[str, Any]) -> int:
     bonus = 0
     bonus_tags = loyalty.get('bonus_tags', [])
     
+    # 基于实际返回的 bonus_tags 动态加分
     if 'private_room' in bonus_tags:
         bonus += 10
     if 'late_checkout' in bonus_tags:
@@ -250,7 +254,7 @@ def filter_by_bundle(
     combinations: List[Tuple],
     context_info: Dict[str, Any]
 ) -> List[Tuple]:
-    """如果有 bundle，只保留符合 bundle 的组合"""
+    """如果有 bundle，只保留符合 bundle 的组合 - 基于工具调用获取的真实数据"""
     
     promotions = context_info.get("promotions", [])
     dependencies = context_info.get("dependencies", [])
@@ -312,7 +316,7 @@ def filter_by_bundle(
 
 
 def extract_user_requirements(turns: List[Dict], state: Dict[str, Any], episode: Dict[str, Any]) -> Dict[str, Any]:
-    """从对话和场景状态提取用户需求"""
+    """从对话和场景状态提取用户需求 - 仅从可观察数据"""
     
     all_text = " ".join([t.get('text', '').lower() for t in turns])
     
@@ -331,11 +335,10 @@ def extract_user_requirements(turns: List[Dict], state: Dict[str, Any], episode:
 
 
 def extract_spoken_rules_from_turns(episode: Dict[str, Any]) -> Dict[str, List[str]]:
-    """从对话中提取口语规则 - 增强版，更精确的匹配"""
+    """从对话中提取口语规则 - 完全基于对话文本，不使用 scenario_state"""
     
     turns = episode.get('turns', [])
     all_text = ' '.join([turn.get('text', '').lower() for turn in turns])
-    state = episode.get('scenario_state', {})
     
     rules = {
         'must_remember': [],
@@ -346,169 +349,72 @@ def extract_spoken_rules_from_turns(episode: Dict[str, Any]) -> Dict[str, List[s
         'keep_context_lean': []
     }
     
-    # ========== 1. MUST_REMEMBER (必须记住的规则) ==========
-    quiet_keywords = [
-        'quiet room', 'quiet matters', 'genuinely quiet', 'quiet hotel',
-        'need quiet', 'quiet place', 'keep it quiet', 'quiet matters to me',
-        'quiet room matters', 'quiet night', 'sleep quality'
-    ]
-    if any(kw in all_text for kw in quiet_keywords):
+    # ========== 1. MUST_REMEMBER (从对话中提取) ==========
+    if 'quiet' in all_text:
         rules['must_remember'].append('quiet_matters')
     
-    client_keywords = [
-        'polished', 'client-ready', 'client-facing', 'client dinner',
-        'professional dinner', 'board-facing', 'reliable and polished',
-        'client optics', 'client conversation', 'polished enough',
-        'feel polished', 'presentable dinner'
-    ]
-    if any(kw in all_text for kw in client_keywords):
+    if 'polished' in all_text or 'client' in all_text:
         rules['must_remember'].append('client_ready_dinner')
     
-    early_keywords = [
-        'arrive ready', 'early conference', 'meeting safe',
-        'arrive prepared', 'conference ready', 'early morning',
-        'morning session', 'before the conference'
-    ]
-    if any(kw in all_text for kw in early_keywords):
+    if 'arrive ready' in all_text or 'early conference' in all_text:
         rules['must_remember'].append('meeting_safe_arrival')
     
-    # ========== 2. FORBIDDEN (禁止的规则) ==========
-    red_eye_keywords = [
-        'red-eye', 'red eye', 'do not send me through a red-eye',
-        'avoid red-eye', 'no red eye', 'never red-eye',
-        'do not send me through a red-eye just because', 'late night flight',
-        'overnight flight', 'avoid overnight', 'not a red-eye'
-    ]
-    if any(kw in all_text for kw in red_eye_keywords):
+    # ========== 2. FORBIDDEN (从对话中提取) ==========
+    if 'red-eye' in all_text or 'red eye' in all_text:
         rules['forbidden'].append('red_eye')
     
-    loud_keywords = [
-        'loud after 10pm', 'nightlife spillover', 'feel loud after 10pm',
-        'noise after 10', 'loud at night', 'quiet after 10',
-        'places that feel loud after 10pm', 'nightlife noise',
-        'loud music', 'noisy area', 'keep it quiet at night'
-    ]
-    if any(kw in all_text for kw in loud_keywords):
+    if 'loud after 10pm' in all_text or 'nightlife' in all_text:
         rules['forbidden'].append('loud_after_10pm')
     
-    # ========== 3. ONE_OFF_ONLY (本次旅行例外) ==========
-    trip_only = 'this trip only' in all_text or 'for this trip only' in all_text
-    
-    if trip_only:
-        airport_keywords = ['airport access', 'airport priority', 'airport matters', 'access matters']
-        if any(kw in all_text for kw in airport_keywords):
+    # ========== 3. ONE_OFF_ONLY (从对话中提取) ==========
+    if 'this trip only' in all_text or 'for this trip only' in all_text:
+        if 'airport' in all_text:
             rules['one_off_only'].append('airport_access_more_important_now')
-        
-        chain_keywords = ['chain', 'chain hotel', 'chain is acceptable', 'brand hotel']
-        if any(kw in all_text for kw in chain_keywords):
+        if 'chain' in all_text:
             rules['one_off_only'].append('chain_ok_this_trip')
     
-    # ========== 4. RETIRE (退休的旧规则) ==========
-    retire_indicators = [
-        'retire', 'drop', 'stop carrying', 'no longer valid', 
-        'stale', 'archive', 'older budget', 'assumption is no longer valid',
-        'retire it', 'do not carry', 'stop using'
-    ]
-    has_retire = any(ind in all_text for ind in retire_indicators)
-    
-    if has_retire:
-        if 'budget' in all_text or 'cap' in all_text or 'budget assumption' in all_text:
+    # ========== 4. RETIRE (从对话中提取，不用 scenario_state) ==========
+    retire_indicators = ['retire', 'drop', 'stop carrying', 'no longer valid', 'stale', 'archive']
+    if any(ind in all_text for ind in retire_indicators):
+        if 'budget' in all_text or 'cap' in all_text:
             rules['retire'].append('old_budget_cap')
-        
-        if 'local character' in all_text or 'local preference' in all_text or 'neighborhood character' in all_text:
+        if 'local character' in all_text:
             rules['retire'].append('local_character_if_safe')
-        
-        if 'chain' in all_text and 'avoid' in all_text:
+        if 'chain' in all_text:
             rules['retire'].append('avoid_chain_hotels_stable')
-        
-        if 'bundle discount' in all_text or 'discount always wins' in all_text:
+        if 'bundle' in all_text:
             rules['retire'].append('old_bundle_discount_absolute')
-        
-        if 'weather' in all_text or 'dry weather' in all_text or 'weather assumption' in all_text:
+        if 'weather' in all_text:
             rules['retire'].append('old_weather_assumption')
-        
-        if 'social bundle' in all_text or 'partner social' in all_text:
+        if 'social' in all_text:
             rules['retire'].append('old_social_bundle_default')
-        
-        if 'late checkin' in all_text or 'late arrival' in all_text or 'perks disappear' in all_text:
+        if 'late checkin' in all_text:
             rules['retire'].append('late_checkin_irrelevant')
-        
-        if 'chain absolute' in all_text:
-            rules['retire'].append('old_chain_absolute_rule')
     
-    # 从场景状态推断退休规则
-    if state.get('airport_priority') and 'local_character_if_safe' not in rules['retire']:
-        rules['retire'].append('local_character_if_safe')
-    if state.get('chain_exception') and 'avoid_chain_hotels_stable' not in rules['retire']:
-        rules['retire'].append('avoid_chain_hotels_stable')
-    if state.get('rainy') and 'old_weather_assumption' not in rules['retire']:
-        rules['retire'].append('old_weather_assumption')
-    if state.get('partner_bundle') and 'old_bundle_discount_absolute' not in rules['retire']:
-        rules['retire'].append('old_bundle_discount_absolute')
-    if state.get('late_arrival_risk') and 'late_checkin_irrelevant' not in rules['retire']:
-        rules['retire'].append('late_checkin_irrelevant')
-    
-    # ========== 5. DO_NOT_RECONSIDER (不再考虑的选项) ==========
-    hotel_reject = [
-        'reject a hotel', 'noise rejected', 'reject for noise',
-        'do not surface again', 'do not bring back'
-    ]
-    if any(kw in all_text for kw in hotel_reject):
+    # ========== 5. DO_NOT_RECONSIDER (从对话中提取) ==========
+    if 'reject' in all_text and 'hotel' in all_text:
         rules['do_not_reconsider'].append('noise_rejected_hotel')
-    
-    restaurant_reject = [
-        'dinner option is out', 'wrong vibe', 'wrong vibe restaurant',
-        'dinner option out', 'vibe is wrong'
-    ]
-    if any(kw in all_text for kw in restaurant_reject):
+    if 'dinner option is out' in all_text or 'wrong vibe' in all_text:
         rules['do_not_reconsider'].append('wrong_vibe_restaurant')
     
-    flight_reject = [
-        'rejected flight', 'red-eye rejected', 'reject a flight',
-        'do not send me through'
-    ]
-    if any(kw in all_text for kw in flight_reject):
-        rules['do_not_reconsider'].append('rejected_flight_for_red_eye')
-    
-    # ========== 6. KEEP_CONTEXT_LEAN (保持上下文简洁) ==========
+    # ========== 6. KEEP_CONTEXT_LEAN ==========
     rules['keep_context_lean'].append('relevant_only')
-    
-    lean_keywords = [
-        'keep active context lean', 'relevant old preferences',
-        'lean context', 'only relevant', 'bring back only the relevant',
-        'keep context lean', 'active context lean'
-    ]
-    if any(kw in all_text for kw in lean_keywords):
+    if 'keep active context lean' in all_text or 'relevant old preferences' in all_text:
         rules['keep_context_lean'].append('lean_context')
     
     # 去重
     for key in rules:
         rules[key] = list(dict.fromkeys(rules[key]))
     
-    # 打印详细信息
+    # 打印
     print("\n" + "="*80)
-    print("📝 提取的 Spoken Rules (增强版)")
+    print("📝 提取的 Spoken Rules (从对话)")
     print("="*80)
-    print(f"  对话长度: {len(all_text)} 字符")
-    print(f"  规则统计:")
     for key, values in rules.items():
         if values:
-            print(f"    {key}: {values}")
+            print(f"  {key}: {values}")
         else:
-            print(f"    {key}: []")
-    
-    # 额外打印匹配到的关键词
-    print(f"\n  🔍 检测到的关键词:")
-    if 'quiet' in all_text:
-        print(f"    - quiet 相关: ✓")
-    if 'red-eye' in all_text or 'red eye' in all_text:
-        print(f"    - red-eye 相关: ✓")
-    if 'polished' in all_text:
-        print(f"    - polished 相关: ✓")
-    if 'this trip only' in all_text:
-        print(f"    - this trip only: ✓")
-    if 'retire' in all_text:
-        print(f"    - retire 相关: ✓")
+            print(f"  {key}: []")
     
     return rules
 
@@ -518,7 +424,7 @@ def build_memory_report_from_context(
     context_info: Dict[str, Any],
     requirements: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """构建 memory_report - 正确退休 stale 文档 + 完整口语规则"""
+    """构建 memory_report - 安全版，修复大小写问题"""
     
     state = episode.get('scenario_state', {})
     turns = episode.get('turns', [])
@@ -546,7 +452,7 @@ def build_memory_report_from_context(
         active_context_keys.append('prefer_quiet_hotel')
     if requirements["no_red_eye"]:
         active_context_keys.append('avoid_red_eye')
-    if requirements["need_airport"] or state.get('airport_priority'):
+    if requirements["need_airport"]:
         active_context_keys.append('prefer_airport_access')
     if requirements["need_refund"]:
         active_context_keys.append('refundable_priority')
@@ -576,46 +482,47 @@ def build_memory_report_from_context(
             retired.append('old_bundle_discount_absolute')
         if 'weather' in all_text:
             retired.append('old_weather_assumption')
-        if 'late checkin' in all_text:
-            retired.append('late_checkin_irrelevant')
-    
-    if state.get('airport_priority'):
-        retired.append('local_character_if_safe')
-    if state.get('chain_exception'):
-        retired.append('avoid_chain_hotels_stable')
-    if state.get('rainy'):
-        retired.append('old_weather_assumption')
-    if state.get('partner_bundle'):
-        retired.append('old_bundle_discount_absolute')
-    if state.get('late_arrival_risk'):
-        retired.append('late_checkin_irrelevant')
     
     retired = list(dict.fromkeys(retired))[:8]
     
-    # ========== retired_docs - 映射退休键到 stale 文档 ==========
-    stale_doc_map = {
-        'old_budget_cap': 'stale:budget_cap_archive',
-        'local_character_if_safe': 'stale:local_character_default',
-        'avoid_chain_hotels_stable': 'stale:avoid_chain_hotels_absolute',
-        'old_bundle_discount_absolute': 'stale:bundle_discount_always_wins',
-        'old_weather_assumption': 'stale:dry_weather_ops_assumption',
-        'old_social_bundle_default': 'stale:partner_social_default',
-        'late_checkin_irrelevant': 'stale:late_checkin_irrelevant',
-        'old_chain_absolute_rule': 'stale:avoid_chain_hotels_absolute',
-        'old_local_character_priority': 'stale:local_character_default',
-    }
-    
+    # ========== retired_docs - 动态匹配，大小写不敏感 ==========
     retired_docs = []
-    for doc_id in context_info.get("docs_retrieved", []):
-        if doc_id.startswith("stale:"):
-            for retire_key in retired:
-                if retire_key in stale_doc_map and stale_doc_map[retire_key] == doc_id:
-                    if doc_id not in retired_docs:
-                        retired_docs.append(doc_id)
-                    break
     
-    if not retired_docs and has_retire:
-        retired_docs.append('stale:budget_cap_archive')
+    for stale_doc in context_info.get("stale_docs", []):
+        doc_id = stale_doc.get('doc_id', '')
+        doc_text = stale_doc.get('text', '').lower()
+        
+        # 关键修复：doc_id 也转小写
+        doc_id_lower = doc_id.lower()
+        
+        should_retire = False
+        for retire_key in retired:
+            retire_key_lower = retire_key.lower()
+            
+            # 检查是否应该退休这个文档
+            if 'budget' in retire_key_lower:
+                if ('budget' in doc_id_lower or 'budget' in doc_text or 
+                    'cap' in doc_id_lower or 'cap' in doc_text):
+                    should_retire = True
+            elif 'local_character' in retire_key_lower:
+                if ('local' in doc_id_lower or 'local' in doc_text or 
+                    'character' in doc_id_lower or 'character' in doc_text):
+                    should_retire = True
+            elif 'chain' in retire_key_lower:
+                if ('chain' in doc_id_lower or 'chain' in doc_text):
+                    should_retire = True
+            elif 'bundle' in retire_key_lower:
+                if ('bundle' in doc_id_lower or 'bundle' in doc_text or 
+                    'discount' in doc_id_lower or 'discount' in doc_text):
+                    should_retire = True
+            elif 'weather' in retire_key_lower:
+                if ('weather' in doc_id_lower or 'weather' in doc_text or 
+                    'dry' in doc_id_lower or 'dry' in doc_text):
+                    should_retire = True
+        
+        if should_retire and doc_id_lower.startswith('stale:'):
+            if doc_id not in retired_docs:
+                retired_docs.append(doc_id)
     
     # ========== rejected_option_notes ==========
     rejected_option_notes = []
@@ -626,12 +533,23 @@ def build_memory_report_from_context(
             rejected_option_notes.append(f"{reason_key}:{option_id}")
     rejected_option_notes = list(dict.fromkeys(rejected_option_notes))[:6]
     
-    # ========== spoken_rule_hits - 使用增强版规则提取 ==========
+    # ========== spoken_rule_hits ==========
     spoken_rule_hits = extract_spoken_rules_from_turns(episode)
     
-    # 确保 retire 规则从 retired 键同步
-    if not spoken_rule_hits.get('retire') and retired:
-        spoken_rule_hits['retire'] = retired[:5]
+    # ========== ignored_distractors ==========
+    ignored_distractors = []
+    for doc in context_info.get("heuristics", []):
+        doc_id = doc.get('doc_id', '')
+        doc_id_lower = doc_id.lower()
+        
+        # 动态判断
+        if 'distractor' in doc_id_lower:
+            if doc_id not in ignored_distractors:
+                ignored_distractors.append(doc_id)
+        elif doc_id_lower.startswith('stale:') and doc_id not in retired_docs:
+            if doc_id not in ignored_distractors:
+                ignored_distractors.append(doc_id)
+    ignored_distractors = ignored_distractors[:4]
     
     # 打印调试信息
     print("\n" + "="*80)
@@ -639,6 +557,7 @@ def build_memory_report_from_context(
     print("="*80)
     print(f"  retired: {retired}")
     print(f"  retired_docs: {retired_docs}")
+    print(f"  ignored_distractors: {ignored_distractors}")
     print(f"  active_context_keys: {active_context_keys[:4]}...")
     
     return {
@@ -649,6 +568,6 @@ def build_memory_report_from_context(
         "active_context_keys": active_context_keys,
         "docs_retrieved": docs_retrieved,
         "active_docs": docs_retrieved[:4],
-        "ignored_distractors": [],
+        "ignored_distractors": ignored_distractors,
         "spoken_rule_hits": spoken_rule_hits,
     }

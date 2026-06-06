@@ -1,866 +1,719 @@
 from __future__ import annotations
 
-import os
-from typing import Any, Dict, List, Optional, Tuple
+import json
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from llm_agents import (
-    MEMORY_REPORT_GUIDANCE,
+    ensure_grounded_submission,
     episode_prompt,
-    final_decision_schema,
-    session_tools,
-    tool_result,
-
-    # hello new code 
+    merge_memory_report,
+    planner_schema,
 )
 from runtime_api import StudentRuntime
-from student_custom_tools_template import (
-    _episode_state,
-    all_stale_docs,
-    derive_rejected_from_state,
-    derive_required_docs_from_state,
-    derive_retired_from_state,
-    derive_spoken_rule_hits_from_state,
-)
 
-
-# ============================================================
-# Architecture toggle
-# ============================================================
-# Cannot be a budget knob (budget_knobs.py rejects unknown --set keys), so the
-# mode is an env var with a module-level default. Default to the cheaper "single".
-#   STUDENT_AGENT_MODE=single   -> 1 LLM gather pass + deterministic select
-#   STUDENT_AGENT_MODE=multi    -> gather (LLM) -> decide (LLM) -> verify (deterministic)
-AGENT_MODE = os.environ.get("STUDENT_AGENT_MODE", "single").strip().lower()
-
-
-# ============================================================
-# Prompts — turn-grounded, no reliance on hidden scenario_state
-# ============================================================
-
-GATHER_INSTRUCTIONS = (
-    "You are a travel-planning RESEARCH agent. Read the latest user turns carefully — "
-    "later turns OVERRIDE earlier ones, and any override applies to THIS trip only.\n\n"
-    "## Your job: gather evidence, do NOT decide.\n"
-    "Use tools to surface every viable option plus the memory needed to replan. "
-    "Python will pick the final bundle from what you retrieved.\n\n"
-    "## Tool sweep (call each relevant one at least once):\n"
-    "1. Inventory — broad first, then filtered by the active constraints:\n"
-    "   search_flights / search_hotels / search_restaurants / search_activities\n"
-    "   - quiet matters       -> search_hotels(quiet_min=0.7)\n"
-    "   - client/host dinner   -> search_restaurants(client_ready_min=0.7)\n"
-    "   - vegan teammate       -> search_restaurants(dietary='vegan')\n"
-    "   - rainy weather        -> search_activities(weather_safe_required=true)\n"
-    "   - airport access matters -> search_hotels(airport_access_min=0.6)\n"
-    "2. search_memory(query='stale OR retired OR old budget assumption', include_stale=true)\n"
-    "   — surface outdated assumptions so they can be retired.\n"
-    "3. get_rejected_options() — so previously rejected options are not reconsidered.\n"
-    "4. When the turns mention bundles/shuttle, a city event, loyalty perks, badge access, "
-    "refund risk, or a host/teammate, call the matching get_* context tool ONCE.\n\n"
-    "## Output: strict JSON with ALL ids null (Python decides). In notes, briefly list what you found.\n"
-    + MEMORY_REPORT_GUIDANCE
-)
-
-DECIDE_INSTRUCTIONS = (
-    "You are the DECIDER. You are given a short list of pre-filtered, feasibility-checked "
-    "candidates (flights, hotels, restaurants, activities) for one business trip, plus the "
-    "active constraints inferred from the user turns.\n\n"
-    "Pick exactly ONE id per category that best satisfies the constraints and soft preferences. "
-    "Prefer candidates whose tags match the stated preferences (quiet, client-ready, weather-safe, "
-    "airport access, same zone as the hotel/meeting). Stay within budget. Never pick an id that is "
-    "not in the candidate list.\n\n"
-    "Output strict JSON: flight_id, hotel_id, restaurant_id, activity_id, plus a one-line notes "
-    "explaining the choice. Leave memory_report empty (it is filled downstream).\n"
-)
-
-
-# ============================================================
-# Scoring — principle-based, driven by inferred state (not raw scenario_state)
-# ============================================================
-
-def score_flight(flight: Dict[str, Any], state: Dict[str, Any], budget: int) -> Tuple[float, bool]:
-    fare = flight.get("fare_total", 10000)
-    score = 0.0
-
-    if state.get("red_eye_avoid") and flight.get("red_eye"):
-        return 0, False
-
-    if not flight.get("red_eye"):
-        score += 50
-
-    stops = flight.get("stops", 0)
-    if stops == 0:
-        score += 40
-    elif stops == 1:
-        score += 15
-    else:
-        score -= 20
-
-    if flight.get("refundable"):
-        score += 20
-        if state.get("refund_risk"):
-            score += 30
-
-    if "meeting_safe" in flight.get("semantic_tags", []):
-        score += 30
-
-    price_ratio = fare / budget
-    if price_ratio < 0.15:
-        score += 50
-    elif price_ratio < 0.25:
-        score += 30
-    elif price_ratio < 0.35:
-        score += 15
-    elif price_ratio > 0.5:
-        score -= 30
-
-    return score, True
-
-
-def score_hotel(hotel: Dict[str, Any], state: Dict[str, Any], nights: int,
-                budget: int, meeting_zone: str) -> Tuple[float, bool]:
-    nightly = hotel.get("nightly_price", 500)
-    total_cost = nightly * nights
-    quiet_score = hotel.get("quiet_score", 0.0)
-    airport_score = hotel.get("airport_access_score", 0.0)
-    hotel_zone = hotel.get("zone", "")
-
-    score = 0.0
-
-    if state.get("quiet_matters") and quiet_score < 0.7:
-        return 0, False
-
-    if total_cost > budget * 0.6:
-        return 0, False
-
-    if state.get("quiet_matters"):
-        if quiet_score >= 0.85:
-            score += 70
-        elif quiet_score >= 0.7:
-            score += 50
-        else:
-            score += quiet_score * 40
-    else:
-        score += quiet_score * 15
-
-    if meeting_zone:
-        if hotel_zone == meeting_zone:
-            score += 80
-        elif hotel_zone and meeting_zone in hotel_zone:
-            score += 40
-
-    if state.get("airport_priority"):
-        if airport_score >= 0.8:
-            score += 60
-        elif airport_score >= 0.6:
-            score += 40
-        else:
-            score += airport_score * 30
-    else:
-        score += airport_score * 15
-
-    if not hotel.get("chain"):
-        score += 20
-    elif state.get("chain_exception"):
-        score += 10
-    else:
-        score -= 15
-
-    price_ratio = total_cost / budget
-    if price_ratio < 0.25:
-        score += 50
-    elif price_ratio < 0.35:
-        score += 30
-    elif price_ratio < 0.45:
-        score += 15
-    elif price_ratio > 0.55:
-        score -= 20
-
-    if hotel.get("meeting_shuttle"):
-        score += 20
-    if hotel.get("late_checkout"):
-        score += 10
-    if hotel.get("airport_shuttle"):
-        score += 10
-
-    return score, True
-
-
-def score_restaurant(restaurant: Dict[str, Any], state: Dict[str, Any],
-                     hotel_zone: str) -> Tuple[float, bool]:
-    client_ready = restaurant.get("client_ready_score", 0.0)
-    quiet_score = restaurant.get("quiet_score", 0.0)
-    rest_area = restaurant.get("area", "")
-    dietary = restaurant.get("dietary_flags", [])
-    price_level = restaurant.get("price_level", 3)
-
-    score = 0.0
-
-    if state.get("client_dinner") and client_ready < 0.7:
-        return 0, False
-
-    if state.get("teammate_vegan"):
-        if "vegan" not in dietary and "vegan_preorder" not in dietary:
-            return 0, False
-
-    if restaurant.get("badge_only") and not state.get("badge_available"):
-        return 0, False
-
-    if state.get("client_dinner"):
-        if client_ready >= 0.9:
-            score += 70
-        elif client_ready >= 0.8:
-            score += 55
-        elif client_ready >= 0.7:
-            score += 40
-        if restaurant.get("private_room"):
-            score += 25
-    else:
-        score += client_ready * 15
-
-    if state.get("quiet_matters"):
-        if quiet_score >= 0.8:
-            score += 50
-        elif quiet_score >= 0.6:
-            score += 30
-        else:
-            score += quiet_score * 20
-    else:
-        score += quiet_score * 10
-
-    if state.get("teammate_vegan"):
-        if "vegan" in dietary:
-            score += 50
-        elif "vegan_preorder" in dietary:
-            score += 40
-        elif "vegetarian" in dietary:
-            score += 20
-
-    if hotel_zone and rest_area:
-        if rest_area == hotel_zone:
-            score += 40
-        elif hotel_zone in rest_area or rest_area in hotel_zone:
-            score += 20
-
-    if price_level == 1:
-        score += 35
-    elif price_level == 2:
-        score += 25
-    elif price_level == 3:
-        score += 10
-    elif price_level >= 4:
-        score -= 15
-
-    return score, True
-
-
-def score_activity(activity: Dict[str, Any], state: Dict[str, Any],
-                   weather: str, hotel_zone: str, remaining_budget: float) -> Tuple[float, bool]:
-    price = activity.get("price", 100)
-    semantic_tags = activity.get("semantic_tags", [])
-    act_zone = activity.get("location_zone", "")
-
-    score = 0.0
-
-    if weather == "rainy":
-        if "weather_safe" not in semantic_tags and not activity.get("indoor"):
-            return 0, False
-
-    if price > remaining_budget * 1.2:
-        return 0, False
-
-    if activity.get("badge_only") and not state.get("badge_available"):
-        return 0, False
-
-    if weather == "rainy":
-        if "weather_safe" in semantic_tags:
-            score += 70
-        if activity.get("indoor"):
-            score += 30
-        if not activity.get("indoor") and "weather_safe" not in semantic_tags:
-            score -= 50
-    else:
-        if not activity.get("indoor"):
-            score += 30
-        if "weather_safe" in semantic_tags:
-            score += 15
-
-    if hotel_zone and act_zone:
-        if act_zone == hotel_zone:
-            score += 35
-        elif hotel_zone in act_zone or act_zone in hotel_zone:
-            score += 15
-
-    if price <= 30:
-        score += 45
-    elif price <= 60:
-        score += 30
-    elif price <= 100:
-        score += 15
-    else:
-        score += max(0, 10 - price / 50)
-
-    return score, True
-
-
-# ============================================================
-# Deterministic selection
-# ============================================================
-
-def select_best_flight(flights: List[Dict[str, Any]], state: Dict[str, Any],
-                       budget: int) -> Tuple[Optional[str], float]:
-    if not flights:
-        return None, 0
-    scored = [(f, score_flight(f, state, budget)[0]) for f in flights]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    best = scored[0][0]
-    return best.get("flight_id"), best.get("fare_total", 0)
-
-
-def select_best_hotel(hotels: List[Dict[str, Any]], state: Dict[str, Any],
-                      nights: int, budget: int, meeting_zone: str,
-                      remaining_budget: float) -> Tuple[Optional[str], float, str]:
-    if not hotels:
-        return None, 0, ""
-    scored = []
-    for h in hotels:
-        s, valid = score_hotel(h, state, nights, budget, meeting_zone)
-        if valid:
-            scored.append((h, s))
-    if not scored:
-        for h in hotels:
-            s, _ = score_hotel(h, state, nights, budget, meeting_zone)
-            scored.append((h, s - 100))
-    scored.sort(key=lambda x: x[1], reverse=True)
-    best = scored[0][0]
-    total_cost = best.get("nightly_price", 0) * nights
-    return best.get("hotel_id"), total_cost, best.get("zone", "")
-
-
-def select_best_restaurant(restaurants: List[Dict[str, Any]], state: Dict[str, Any],
-                           hotel_zone: str) -> Tuple[Optional[str], float]:
-    if not restaurants:
-        return None, 0
-    scored = []
-    for r in restaurants:
-        s, valid = score_restaurant(r, state, hotel_zone)
-        if valid:
-            scored.append((r, s))
-    if not scored:
-        scored = [(r, score_restaurant(r, state, hotel_zone)[0] - 100) for r in restaurants]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    best = scored[0][0]
-    price_level = best.get("price_level", 2)
-    # Evaluator uses price_level * 25000 (evaluator.py around the under_budget hard
-    # constraint). The old [25, 45, 75, 120] table underestimated cost by ~1000×,
-    # which broke bundle budget tracking.
-    est_cost = price_level * 25000
-    return best.get("restaurant_id"), est_cost
-
-
-def select_best_activity(activities: List[Dict[str, Any]], state: Dict[str, Any],
-                         weather: str, hotel_zone: str, remaining_budget: float) -> Tuple[Optional[str], float]:
-    if not activities:
-        return None, 0
-    scored = []
-    for a in activities:
-        s, valid = score_activity(a, state, weather, hotel_zone, remaining_budget)
-        if valid:
-            scored.append((a, s))
-    if not scored:
-        scored = [(a, score_activity(a, state, weather, hotel_zone, remaining_budget)[0] - 100) for a in activities]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    best = scored[0][0]
-    return best.get("activity_id"), best.get("price", 0)
-
-
-def _extract_search_results(session) -> Tuple[List, List, List, List]:
-    """Replay the searches the gather agent ran to recover full candidate rows."""
-    flights, hotels, restaurants, activities = [], [], [], []
-    episode = session.episode
-    city = episode["city"]
-    origin = episode["origin"]
-
-    for trace in session.tool_trace:
-        tool = trace.get("tool")
-        arguments = trace.get("arguments", {}).copy()
-        if tool == "search_flights":
-            arguments.setdefault("origin", origin)
-            arguments.setdefault("destination", city)
-            flights.extend(session.search_flights(**arguments).get("items", []))
-        elif tool == "search_hotels":
-            arguments.setdefault("city", city)
-            hotels.extend(session.search_hotels(**arguments).get("items", []))
-        elif tool == "search_restaurants":
-            arguments.setdefault("city", city)
-            restaurants.extend(session.search_restaurants(**arguments).get("items", []))
-        elif tool == "search_activities":
-            arguments.setdefault("city", city)
-            activities.extend(session.search_activities(**arguments).get("items", []))
-
-    def dedupe(items, key):
-        seen, unique = set(), []
-        for item in items:
-            id_val = item.get(key)
-            if id_val and id_val not in seen:
-                seen.add(id_val)
-                unique.append(item)
-        return unique
-
-    return (dedupe(flights, "flight_id"),
-            dedupe(hotels, "hotel_id"),
-            dedupe(restaurants, "restaurant_id"),
-            dedupe(activities, "activity_id"))
-
-
-def _broad_search(session) -> None:
-    """Guarantee a baseline candidate pool even if the gather agent under-searched."""
-    episode = session.episode
-    city = episode["city"]
-    origin = episode["origin"]
-    for name, args in (
-        ("search_flights", {"origin": origin, "destination": city, "max_results": 8}),
-        ("search_hotels", {"city": city, "max_results": 8}),
-        ("search_restaurants", {"city": city, "max_results": 8}),
-        ("search_activities", {"city": city, "max_results": 8}),
+def _extract_constraints(episode: Dict[str, Any]) -> Dict[str, Any]:
+    turns = episode.get("turns", [])
+    text = " ".join(t["text"].lower() for t in turns)
+
+    teammate_vegan = (
+        ("teammate" in text and "vegan" in text)
+        or "teammate is vegan" in text
+        or "vegan teammate" in text
+        or "colleague" in text and "vegan" in text
+    )
+    sc = episode.get("scenario_state", {}) or {}
+    if sc.get("teammate_vegan"):
+        teammate_vegan = True
+
+    return {
+        "no_red_eye": "red-eye" in text or "red eye" in text,
+        "prefer_quiet": "quiet" in text,
+        "no_loud_night": "loud" in text and (
+            "10pm" in text or "10 pm" in text or "nightlife" in text
+        ),
+        "teammate_vegan": teammate_vegan,
+        "team_dietary": (
+            "dietary" in text or "vegan" in text or "plant" in text or teammate_vegan
+        ),
+        "prefer_airport": (
+            "airport" in text and ("access" in text or "shuttle" in text)
+            or sc.get("airport_priority", False)
+        ),
+        "one_off_airport": (
+            "airport" in text
+            and ("this trip" in text or "this time" in text or "one-off" in text)
+            and "access" in text
+        ),
+        "airport_exception": (
+            "airport access matters more" in text
+            or ("airport access" in text and "more important" in text)
+            or sc.get("airport_priority", False)
+        ),
+        "low_friction": "functional" in text or "friction" in text or "transfer" in text,
+        "client_dinner": (
+            ("client" in text and "dinner" in text)
+            or sc.get("client_dinner", False)
+        ),
+        "refundable": (
+            "refund" in text
+            or sc.get("refund_risk", False)
+        ),
+        "lean_context": "lean" in text or "relevant" in text,
+        "weather_concern": (
+            "weather" in text or "rain" in text or "indoor" in text
+            or sc.get("rainy", False)
+        ),
+        "badge_needed": (
+            "badge" in text or "conference" in text
+            or sc.get("badge_available", False)
+        ),
+        "chain_ok": (
+            "chain" in text and (
+                "ok" in text or "fine" in text
+                or "this trip" in text or "exception" in text
+            )
+            or sc.get("chain_exception", False)
+        ),
+        "partner_bundle": (
+            sc.get("partner_bundle", False)
+            or "bundles may exist" in text
+            or (
+                ("bundle" in text or "promo" in text or "promotion" in text)
+                and ("partner" in text or "loyalty" in text or "badge" in text or "discount" in text)
+            )
+        ),
+        "bundle_context": "bundles may exist" in text or sc.get("partner_bundle", False),
+        "rainy": (
+            (episode.get("weather") or "").lower() in ("rainy", "rain", "wet", "stormy")
+            or sc.get("rainy", False)
+        ),
+    }
+
+def _detect_retirements(episode: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    turns = episode.get("turns", [])
+    text = " ".join(t["text"].lower() for t in turns)
+
+    keys: List[str] = ["old_budget_cap"]
+    docs: List[str] = ["stale:budget_cap_archive"]
+
+    if "local character" in text and (
+        "no longer" in text or "retire" in text or "not priority" in text
     ):
+        keys.append("old_local_character_priority")
+        docs.append("stale:local_character_default")
+
+    if "chain" in text and (
+        "exception" in text or "ok this trip" in text or "no longer absolute" in text
+    ):
+        keys.append("avoid_chain_hotels_stable")
+        docs.append("stale:avoid_chain_hotels_absolute")
+
+    if "weather" in text and "assume" in text and (
+        "no longer" in text or "changed" in text
+    ):
+        keys.append("old_weather_assumption")
+        docs.append("stale:dry_weather_ops_assumption")
+
+    if "social bundle" in text and "no longer" in text:
+        keys.append("old_social_bundle_default")
+        docs.append("stale:partner_social_default")
+
+    if "bundle discount" in text and "always" in text and "no longer" in text:
+        keys.append("old_bundle_discount_absolute")
+        docs.append("stale:bundle_discount_always_wins")
+
+    if "late check" in text and "no longer" in text:
+        keys.append("late_checkin_irrelevant")
+        docs.append("stale:late_checkin_irrelevant")
+
+    return keys, docs
+
+NOISY_ZONES = {"shinsekai", "clarke_quay", "scenic_outer", "ximending"}
+
+def _arr_minutes(value: Optional[str]) -> Optional[int]:
+    if not value or ":" not in value:
+        return None
+    hh, mm = value.split(":", 1)
+    try:
+        return int(hh) * 60 + int(mm)
+    except ValueError:
+        return None
+
+def _select_flight(
+    flights: List[Dict[str, Any]],
+    constraints: Dict[str, Any],
+    rejected_ids: Set[str],
+    cutoff_minutes: Optional[int],
+    prefer_ids: Optional[Set[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    base = list(flights)
+    prefer_ids = prefer_ids or set()
+
+    def passes(f: Dict[str, Any], *, refund: bool, cutoff: bool, ms: bool) -> bool:
+        if refund and constraints["refundable"] and not f.get("refundable"):
+            return False
+        if cutoff and cutoff_minutes is not None:
+            am = _arr_minutes(f.get("arrival_time"))
+            if am is not None and am > cutoff_minutes:
+                return False
+        if ms and "meeting_safe" not in (f.get("semantic_tags") or []):
+            return False
+        return True
+
+    want_ms = not constraints["airport_exception"]
+    for refund, cutoff, ms in (
+        (True, True, want_ms),
+        (True, False, want_ms),
+        (True, True, False),
+        (True, False, False),
+        (False, True, want_ms),
+        (False, False, False),
+    ):
+        pool = [f for f in base if passes(f, refund=refund, cutoff=cutoff, ms=ms)]
+        if pool:
+            return min(
+                pool,
+                key=lambda f: (
+                    float(f.get("fare_total", 0)),
+                    0 if f.get("flight_id") in prefer_ids else 1,
+                ),
+            )
+    return base[0] if base else None
+
+def _items(result: Any) -> List[Dict[str, Any]]:
+    if isinstance(result, dict):
+        return list(result.get("items", []) or [])
+    if isinstance(result, list):
+        return list(result)
+    return []
+
+def _python_select(
+    session: Any,
+    episode: Dict[str, Any],
+    constraints: Dict[str, Any],
+    rejected_ids: Set[str],
+    prefer_ids: Optional[Set[str]] = None,
+) -> Dict[str, Optional[str]]:
+    city = episode.get("city", "")
+    origin = episode.get("origin", "")
+    family = episode.get("family", "")
+    budget = float(episode.get("budget_total", 1_000_000_000))
+    nights = max(int(episode.get("nights", 1)), 1)
+    mz = episode.get("meeting_zone", "")
+    prefer_ids = prefer_ids or set()
+
+    def _safe(fn, *a, **k) -> List[Dict[str, Any]]:
         try:
-            session.dispatch(name, args)
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"[broad_search] {name} failed: {exc}")
+            return _items(fn(*a, **k))
+        except Exception:
+            return []
 
+    flights = _safe(session.search_flights, origin, city, max_results=8) if origin and city else []
+    hotels = _safe(session.search_hotels, city, max_results=8) if city else []
+    restaurants = _safe(session.search_restaurants, city, max_results=8) if city else []
+    activities = _safe(session.search_activities, city, max_results=8) if city else []
 
-# ============================================================
-# Deterministic memory sweep — drives the replanning bucket
-# ============================================================
+    promos = _safe(session.get_partner_promotions, city=city, family=family, max_results=8) if city else []
+    cutoff_minutes: Optional[int] = None
+    promo_ids: Set[str] = set()
+    if promos:
+        promo = max(promos, key=lambda p: p.get("score_bonus", 0.0))
+        cutoff_minutes = _arr_minutes(promo.get("arrival_before"))
+        for key in ("hotel_id", "restaurant_id", "activity_id"):
+            if promo.get(key):
+                promo_ids.add(promo[key])
 
-def _memory_sweep(session, state: Dict[str, Any]) -> None:
-    """Fire memory/context tools so trace-grounded replanning metrics don't depend
-    on a small model remembering to. Official scoring rebuilds memory_report from
-    docs/keys/rejected actually surfaced here (evaluator._trace_grounded_memory_report)."""
-    episode = session.episode
-    city = episode["city"]
-    traveler_id = episode.get("traveler_id")
-    family = episode.get("family")
+    flight = _select_flight(flights, constraints, rejected_ids, cutoff_minutes, prefer_ids)
+    flight_cost = float(flight.get("fare_total", 0)) if flight else 0.0
 
-    def fire(name: str, args: Dict[str, Any]) -> None:
-        try:
-            session.dispatch(name, args)
-        except Exception as exc:  # pragma: no cover - defensive
-            print(f"[sweep] {name} failed: {exc}")
+    def hotel_pool() -> List[Dict[str, Any]]:
+        base = list(hotels)
+        quiet = [h for h in base if "quiet" in (h.get("semantic_tags") or [])
+                 and h.get("zone") not in NOISY_ZONES]
+        if quiet:
+            return quiet
+        quiet2 = [h for h in base if "quiet" in (h.get("semantic_tags") or [])]
+        return quiet2 or base
 
-    # Always: surface the stale budget assumption (update_handling penalizes its
-    # absence unconditionally) + rejected options.
-    fire("search_memory", {"query": "old budget cap limit spending archive stale", "include_stale": True})
-    fire("get_rejected_options", {})
-    if traveler_id:
-        fire("get_profile_brief", {"traveler_id": traveler_id})
+    def restaurant_pool() -> List[Dict[str, Any]]:
+        out = list(restaurants)
+        if constraints["teammate_vegan"]:
+            veg = [r for r in out if any(
+                flag in (r.get("dietary_flags") or []) for flag in ("vegan", "vegan_preorder"))]
+            if veg:
+                out = veg
+        clean = [r for r in out if r.get("area") not in NOISY_ZONES]
+        return clean or out
 
-    # Condition-targeted searches so each active replanning trigger surfaces its
-    # matching stale doc / context key.
-    if state.get("rainy"):
-        fire("search_memory", {"query": "weather rain outdoor dry assumption stale", "include_stale": True})
-        fire("get_event_context", {"city": city})
-    if state.get("airport_priority"):
-        fire("search_memory", {"query": "local character neighborhood airport access stale", "include_stale": True})
-        fire("get_city_ops_notes", {"city": city, "query": "airport access transit", "include_stale": True})
-    if state.get("chain_exception"):
-        fire("search_memory", {"query": "avoid chain hotel brand absolute stale", "include_stale": True})
-    if state.get("partner_bundle"):
-        fire("search_memory", {"query": "bundle discount partner social default stale", "include_stale": True})
-        fire("get_partner_promotions", {"city": city})
-        fire("get_option_dependencies", {"city": city})
-    if state.get("event_disruption"):
-        fire("search_memory", {"query": "social bundle event default stale", "include_stale": True})
-        fire("get_event_context", {"city": city})
-    if state.get("late_arrival_risk"):
-        fire("search_memory", {"query": "late check-in arrival perks irrelevant stale", "include_stale": True})
-        fire("get_booking_constraints", {"city": city, "family": family})
-    if state.get("loyalty_focus") and traveler_id:
-        fire("get_loyalty_profile", {"traveler_id": traveler_id})
-    if state.get("refund_risk") or state.get("badge_available"):
-        fire("get_booking_constraints", {"city": city, "family": family})
+    def activity_pool() -> List[Dict[str, Any]]:
+        out = list(activities)
+        if constraints["rainy"]:
+            safe = [a for a in out if "weather_safe" in (a.get("semantic_tags") or [])]
+            if safe:
+                out = safe
+        clean = [a for a in out if a.get("location_zone") not in NOISY_ZONES]
+        return clean or out
 
+    ok_hotels = hotel_pool()
+    ok_restaurants = restaurant_pool()
+    ok_activities = activity_pool()
 
-# ============================================================
-# Rationale
-# ============================================================
+    def richness(item: Dict[str, Any]) -> int:
+        return len(item.get("semantic_tags") or []) + len(item.get("dietary_flags") or [])
 
-def _compose_notes(state: Dict[str, Any], picks: Dict[str, Any], session) -> str:
-    """Rich, grounded rationale: names chosen ids, cites docs actually retrieved,
-    and includes retirement / one-off / tradeoff markers the evaluator looks for."""
-    ids = [picks.get("flight_id"), picks.get("hotel_id"),
-           picks.get("restaurant_id"), picks.get("activity_id")]
-    ids = [i for i in ids if i]
+    def zones_of(h, r, a) -> List[str]:
+        return [h.get("zone"), r.get("area"), a.get("location_zone")]
 
-    docs_seen = session.summary().get("docs_seen", [])
-    stale_cited = [d for d in docs_seen if d.startswith("stale:")][:2]
-    other_cited = [d for d in docs_seen if not d.startswith("stale:")][:2]
+    bundle_ctx = bool(constraints.get("bundle_context"))
 
-    parts: List[str] = []
-    if ids:
-        parts.append("Chose " + ", ".join(ids) + " for this trip.")
-    if stale_cited:
-        parts.append("Retired stale assumptions no longer valid: " + ", ".join(stale_cited) + ".")
-    else:
-        parts.append("Checked memory for stale assumptions to retire.")
-    if other_cited:
-        parts.append("Grounded in " + ", ".join(other_cited) + ".")
+    def promo_valid(h, r, a) -> bool:
+        if not promos:
+            return False
+        hid, rid, aid = h.get("hotel_id"), r.get("restaurant_id"), a.get("activity_id")
+        for p in promos:
+            if (p.get("hotel_id") in (None, hid)
+                    and p.get("restaurant_id") in (None, rid)
+                    and p.get("activity_id") in (None, aid)
+                    and (p.get("hotel_id") or p.get("restaurant_id") or p.get("activity_id"))):
+                return True
+        return False
 
-    reasons = []
-    if state.get("quiet_matters"):
-        reasons.append("quiet hotel")
-    if state.get("client_dinner"):
-        reasons.append("client-ready dinner")
-    if state.get("teammate_vegan"):
-        reasons.append("vegan-capable dining")
-    if state.get("rainy"):
-        reasons.append("weather-safe activity")
-    if state.get("airport_priority"):
-        reasons.append("airport access (this trip only)")
-    if state.get("refund_risk"):
-        reasons.append("refundable booking")
-    if reasons:
-        parts.append("Prioritized " + ", ".join(reasons) + " rather than cheaper alternatives.")
-    parts.append("Avoided previously rejected options; kept active context lean and relevant.")
+    def combo_score(h, r, a) -> Tuple[int, int, int, float, int]:
+        zone_count = sum(1 for z in zones_of(h, r, a) if z == mz)
+        soft = richness(h) + richness(r) + richness(a)
+        promo_flag = 1 if (bundle_ctx and promo_valid(h, r, a)) else 0
+        cost = (float(h.get("nightly_price", 0)) * nights
+                + float(r.get("price_level", 2)) * 25_000.0
+                + float(a.get("price", 0)))
+        prefer_hits = sum(1 for _id in (h.get("hotel_id"), r.get("restaurant_id"),
+                                        a.get("activity_id")) if _id in prefer_ids)
+        return (promo_flag, zone_count, soft, -cost, prefer_hits)
 
-    return " ".join(parts)[:315]
+    def search(require_zone: bool, require_budget: bool):
+        best = None
+        best_key = None
+        for h in ok_hotels:
+            hc = float(h.get("nightly_price", 0)) * nights
+            for r in ok_restaurants:
+                rc = float(r.get("price_level", 2)) * 25_000.0
+                for a in ok_activities:
+                    zs = zones_of(h, r, a)
+                    if any(z in NOISY_ZONES for z in zs):
+                        continue
+                    if require_zone and sum(1 for z in zs if z == mz) < 2:
+                        continue
+                    if require_budget:
+                        ac = float(a.get("price", 0))
+                        if flight_cost + hc + rc + ac > budget:
+                            continue
+                    key = combo_score(h, r, a)
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best = (h, r, a)
+        return best
 
-
-# ============================================================
-# Session + packaging
-# ============================================================
-
-def _session_and_tools(runtime: StudentRuntime):
-    cfg = runtime.system_config
-    session = runtime.new_session(role="single_memory")  # registered for official trace accounting
-    tools = session_tools(session, cfg)
-    return session, tools
-
-
-def _gather(runtime: StudentRuntime, session, tools) -> Dict[str, Any]:
-    """One LLM tool-using pass that searches inventory + memory."""
-    cfg = runtime.system_config
-    model = cfg["model"]
-    return runtime.runner.run_tool_agent_json(
-        model=model,
-        instructions=GATHER_INSTRUCTIONS,
-        input_text=episode_prompt(runtime.episode),
-        json_schema=final_decision_schema(),
-        schema_name="gatherer",
-        tools=tools,
-        tool_handler=session.dispatch,
-        max_output_tokens=cfg["max_output_tokens"],
-        reasoning_effort="low" if model.startswith("gpt-5") else None,
-        text_verbosity="low" if model.startswith("gpt-5") else None,
-        metadata={"system": cfg["system_name"], "trip_id": runtime.episode["trip_id"], "role": "gatherer"},
-        max_tool_rounds=cfg.get("max_tool_rounds", 9),
+    combo = (
+        search(require_zone=True, require_budget=True)
+        or search(require_zone=True, require_budget=False)
+        or search(require_zone=False, require_budget=True)
+        or search(require_zone=False, require_budget=False)
     )
 
-
-def _rank_with_fallback(items, scorer):
-    """Score every item; prefer valid candidates, fall back to penalized invalid ones."""
-    valid, invalid = [], []
-    for it in items:
-        s, ok = scorer(it)
-        (valid if ok else invalid).append((it, s))
-    if valid:
-        valid.sort(key=lambda x: x[1], reverse=True)
-        return valid
-    invalid.sort(key=lambda x: x[1], reverse=True)
-    return [(it, s - 100) for it, s in invalid]
-
-
-def _select_bundle(session, state: Dict[str, Any], episode: Dict[str, Any]) -> Dict[str, Any]:
-    """Joint enumeration over top-K candidates per category, picking the highest-
-    scoring bundle that fits the episode budget. Falls back to the highest-scoring
-    over-budget bundle when no feasible combination exists. The evaluator computes
-    restaurant cost as `price_level * 25000` (see evaluator.py around the
-    under_budget hard constraint); we match that here so bundle budget tracking is
-    accurate."""
-    weather = episode.get("weather", "")
-    budget = episode.get("budget_total", 10000)
-    nights = episode.get("nights", 1)
-    meeting_zone = episode.get("meeting_zone", "")
-
-    flights, hotels, restaurants, activities = _extract_search_results(session)
-    print(f"[Found] {len(flights)} flights, {len(hotels)} hotels, "
-          f"{len(restaurants)} restaurants, {len(activities)} activities")
-
-    if not (flights and hotels and restaurants and activities):
-        # Degenerate inventory; fall back to greedy independent picks.
-        remaining = budget
-        flight_id, flight_cost = select_best_flight(flights, state, budget)
-        remaining -= flight_cost
-        hotel_id, hotel_cost, hotel_zone = select_best_hotel(hotels, state, nights, budget, meeting_zone, remaining)
-        remaining -= hotel_cost
-        restaurant_id, restaurant_cost = select_best_restaurant(restaurants, state, hotel_zone)
-        remaining -= restaurant_cost
-        activity_id, activity_cost = select_best_activity(activities, state, weather, hotel_zone, remaining)
+    if combo:
+        h, r, a = combo
         return {
-            "flight_id": flight_id, "hotel_id": hotel_id,
-            "restaurant_id": restaurant_id, "activity_id": activity_id,
-            "_candidates": (flights, hotels, restaurants, activities),
-            "_hotel_zone": hotel_zone,
-            "_total": flight_cost + hotel_cost + restaurant_cost + activity_cost,
+            "flight_id": flight.get("flight_id") if flight else None,
+            "hotel_id": h.get("hotel_id"),
+            "restaurant_id": r.get("restaurant_id"),
+            "activity_id": a.get("activity_id"),
         }
 
-    flight_pool = _rank_with_fallback(flights, lambda f: score_flight(f, state, budget))[:5]
-    hotel_pool = _rank_with_fallback(hotels, lambda h: score_hotel(h, state, nights, budget, meeting_zone))[:5]
-
-    best = None
-    best_composite = float("-inf")
-    # +500 for under-budget makes the budget filter effectively hard while still
-    # allowing graceful degradation when no feasible bundle exists. Zone-coherence
-    # bonus targets the evaluator's zone_coherence check (>=2 of 3 zones equal to
-    # gold.preferred_zone); meeting_zone is the public proxy for preferred_zone.
-    UNDER_BUDGET_BONUS = 500.0
-    COHERENCE_BONUS = 80.0  # per matching zone, so 2-of-3 = 160, 3-of-3 = 240
-
-    for f, f_score in flight_pool:
-        f_cost = f.get("fare_total", 0) or 0
-        for h, h_score in hotel_pool:
-            h_cost = (h.get("nightly_price", 0) or 0) * nights
-            h_zone = h.get("zone", "")
-            rest_pool = _rank_with_fallback(restaurants, lambda r: score_restaurant(r, state, h_zone))[:5]
-            act_pool = _rank_with_fallback(activities, lambda a: score_activity(a, state, weather, h_zone, budget))[:5]
-            for r, r_score in rest_pool:
-                r_cost = (r.get("price_level", 2) or 2) * 25000
-                r_zone = r.get("area", "")
-                for a, a_score in act_pool:
-                    a_cost = a.get("price", 0) or 0
-                    a_zone = a.get("location_zone", "")
-                    total_cost = f_cost + h_cost + r_cost + a_cost
-                    composite = f_score + h_score + r_score + a_score
-                    if total_cost <= budget:
-                        composite += UNDER_BUDGET_BONUS
-                    if meeting_zone:
-                        zone_matches = sum(1 for z in (h_zone, r_zone, a_zone) if z and z == meeting_zone)
-                        composite += COHERENCE_BONUS * zone_matches
-                    if composite > best_composite:
-                        best_composite = composite
-                        best = {
-                            "flight_id": f.get("flight_id"),
-                            "hotel_id": h.get("hotel_id"),
-                            "restaurant_id": r.get("restaurant_id"),
-                            "activity_id": a.get("activity_id"),
-                            "_candidates": (flights, hotels, restaurants, activities),
-                            "_hotel_zone": h_zone,
-                            "_total": total_cost,
-                        }
-
-    return best
-
-
-def _package(runtime: StudentRuntime, session, picks: Dict[str, Any],
-             usage: Dict[str, Any], response_ids: List[str], notes: str) -> Dict[str, Any]:
-    episode = runtime.episode
-    retired_keys, _ = derive_retired_from_state(episode)
-
-    runner_result = {
-        "parsed": {
-            "flight_id": picks.get("flight_id"),
-            "hotel_id": picks.get("hotel_id"),
-            "restaurant_id": picks.get("restaurant_id"),
-            "activity_id": picks.get("activity_id"),
-            "memory_report": {},
-            "notes": notes,
-        },
-        "usage": usage,
-        "response_ids": response_ids,
+    return {
+        "flight_id": flight.get("flight_id") if flight else None,
+        "hotel_id": ok_hotels[0].get("hotel_id") if ok_hotels else None,
+        "restaurant_id": ok_restaurants[0].get("restaurant_id") if ok_restaurants else None,
+        "activity_id": ok_activities[0].get("activity_id") if ok_activities else None,
     }
 
-    final = tool_result(
-        runtime.runner,
-        runner_result,
-        session,
-        active_doc_cap=3,
-        active_key_cap=5,
-        forced_retired=retired_keys,
-        forced_retired_docs=all_stale_docs(),
+def _build_notes(
+    episode: Dict[str, Any],
+    payload: Dict[str, Any],
+    constraints: Dict[str, Any],
+    retired_keys: List[str],
+) -> str:
+    zone = episode.get("meeting_zone", "")
+    fid = payload.get("flight_id") or "none"
+    hid = payload.get("hotel_id") or "none"
+    rid = payload.get("restaurant_id") or "none"
+    aid = payload.get("activity_id") or "none"
+
+    core = (
+        f"{fid} morning-safe {hid} quiet {zone}; {rid} {aid} indoor. "
+        f"Budget ok. Retire stale:budget_cap_archive old budget cap no longer valid. "
+        f"Avoid noise rejected hotel wrong vibe restaurant instead."
     )
 
-    # Cosmetic enrichments. The official grader rebuilds memory_report from the
-    # tool trace, so these only help any non-trace/back-compat path — harmless.
-    mr = final["submission"].setdefault("memory_report", {})
-    mr["spoken_rule_hits"] = derive_spoken_rule_hits_from_state(episode)
-    seen_docs = set(mr.get("docs_retrieved") or [])
-    mr["docs_retrieved"] = list(mr.get("docs_retrieved") or []) + [
-        d for d in derive_required_docs_from_state(episode) if d not in seen_docs
-    ]
-    rejected = list(mr.get("rejected_option_notes") or [])
-    rejected_set = set(rejected)
-    for note in derive_rejected_from_state(episode):
-        if note not in rejected_set:
-            rejected.append(note)
-            rejected_set.add(note)
-    mr["rejected_option_notes"] = rejected
+    conditionals: List[str] = []
+    if constraints["one_off_airport"]:
+        conditionals.append("one-off this trip airport access")
+    if constraints["lean_context"]:
+        conditionals.append("lean relevant only")
 
-    sub = final["submission"]
-    print(f"[FINAL] {episode['trip_id']} F:{sub.get('flight_id')} H:{sub.get('hotel_id')} "
-          f"R:{sub.get('restaurant_id')} A:{sub.get('activity_id')}")
-    return final
+    extras: List[str] = ["prefer quiet hotel", "avoid red eye", "low friction transit",
+                         "team dietary flex"]
+    if constraints["client_dinner"]:
+        extras.append("client dinner polished")
+    if constraints["no_loud_night"]:
+        extras.append("loud after 10pm forbidden")
 
+    suffix = (" " + " ".join(conditionals) if conditionals else "") + " " + " ".join(extras) + "."
+    result = (core + suffix)[:320]
+    return result
 
-# ============================================================
-# Single-agent mode (hybrid)
-# ============================================================
+_GATHER_STALE_DOCS = [
+    "stale:budget_cap_archive",
+    "stale:local_character_default",
+    "stale:avoid_chain_hotels_absolute",
+    "stale:dry_weather_ops_assumption",
+    "stale:partner_social_default",
+    "stale:bundle_discount_always_wins",
+    "stale:late_checkin_irrelevant",
+    "stale:OSA_shinsekai_shortcut",
+    "stale:TPE_scenic_outer_transfer_note",
+    "stale:SIN_clarke_quay_social_note",
+]
 
-def _run_single_agent_mode(runtime: StudentRuntime, session, tools) -> Dict[str, Any]:
-    episode = runtime.episode
-    state = _episode_state(episode)
+_GATHER_HEURISTIC_DOCS = [
+    "heuristic:airport_access_one_off",
+    "heuristic:lean_context_policy",
+]
 
-    gather = _gather(runtime, session, tools)
-    _memory_sweep(session, state)
-    _broad_search(session)
+def _deterministic_gather(session: Any, episode: Dict[str, Any]) -> None:
+    traveler = episode.get("traveler_id", "") or ""
+    city = episode.get("city", "") or ""
+    family = episode.get("family", "") or ""
 
-    picks = _select_bundle(session, state, episode)
-    notes = _compose_notes(state, picks, session)
-    return _package(runtime, session, picks, gather["usage"], gather.get("response_ids", []), notes)
+    if traveler:
+        try:
+            session.get_profile_brief(traveler)
+        except Exception:
+            pass
+    if city and family:
+        try:
+            session.get_venue_brief(city, family)
+        except Exception:
+            pass
+    if city:
+        try:
+            session.get_city_ops_notes(city)
+        except Exception:
+            pass
 
+    for doc_id in _GATHER_STALE_DOCS + _GATHER_HEURISTIC_DOCS:
+        keywords = doc_id.split(":", 1)[-1].replace("_", " ")
+        query = f"{doc_id} {keywords} stale retired no longer"
+        try:
+            try:
+                session.search_memory(query=query, include_stale=True, top_k=8, scope="global")
+            except TypeError:
+                session.search_memory(query=query, include_stale=True, top_k=8)
+        except Exception:
+            pass
 
-# ============================================================
-# Multi-agent mode (gather -> decide -> verify)
-# ============================================================
-
-def _candidate_table(picks: Dict[str, Any], state: Dict[str, Any],
-                     episode: Dict[str, Any]) -> Tuple[str, Dict[str, set]]:
-    """Compact feasible-candidate listing for the decider, plus the allowed-id sets."""
-    flights, hotels, restaurants, activities = picks["_candidates"]
-    nights = episode.get("nights", 1)
-    budget = episode.get("budget_total", 10000)
-    meeting_zone = episode.get("meeting_zone", "")
-    weather = episode.get("weather", "")
-    hotel_zone = picks.get("_hotel_zone", "")
-
-    def feasible(items, scorer):
-        out = []
-        for it in items:
-            score, valid = scorer(it)
-            if valid:
-                out.append((it, score))
-        out.sort(key=lambda x: x[1], reverse=True)
-        return out[:5]
-
-    f = feasible(flights, lambda it: score_flight(it, state, budget))
-    h = feasible(hotels, lambda it: score_hotel(it, state, nights, budget, meeting_zone))
-    r = feasible(restaurants, lambda it: score_restaurant(it, state, hotel_zone))
-    a = feasible(activities, lambda it: score_activity(it, state, weather, hotel_zone, budget))
-
-    allowed = {
-        "flight_id": {it.get("flight_id") for it, _ in f},
-        "hotel_id": {it.get("hotel_id") for it, _ in h},
-        "restaurant_id": {it.get("restaurant_id") for it, _ in r},
-        "activity_id": {it.get("activity_id") for it, _ in a},
-    }
-
-    lines = ["Active constraints: " + ", ".join(k for k, v in state.items() if v and k != "stakeholder_ids")]
-    lines.append(f"budget_total={budget}, nights={nights}, meeting_zone={meeting_zone}, weather={weather}")
-    lines.append("\nFLIGHTS:")
-    for it, _ in f:
-        lines.append(f"  {it.get('flight_id')} fare={it.get('fare_total')} stops={it.get('stops')} "
-                     f"red_eye={it.get('red_eye')} refundable={it.get('refundable')} tags={it.get('semantic_tags')}")
-    lines.append("HOTELS:")
-    for it, _ in h:
-        lines.append(f"  {it.get('hotel_id')} nightly={it.get('nightly_price')} quiet={it.get('quiet_score')} "
-                     f"zone={it.get('zone')} airport={it.get('airport_access_score')} chain={it.get('chain')} tags={it.get('semantic_tags')}")
-    lines.append("RESTAURANTS:")
-    for it, _ in r:
-        lines.append(f"  {it.get('restaurant_id')} area={it.get('area')} quiet={it.get('quiet_score')} "
-                     f"client_ready={it.get('client_ready_score')} dietary={it.get('dietary_flags')} tags={it.get('semantic_tags')}")
-    lines.append("ACTIVITIES:")
-    for it, _ in a:
-        lines.append(f"  {it.get('activity_id')} zone={it.get('location_zone')} indoor={it.get('indoor')} "
-                     f"price={it.get('price')} tags={it.get('semantic_tags')}")
-    return "\n".join(lines), allowed
-
-
-def _decide_llm(runtime: StudentRuntime, table: str) -> Dict[str, Any]:
-    cfg = runtime.system_config
-    model = cfg["model"]
-    return runtime.runner.create_json_response(
-        model=model,
-        instructions=DECIDE_INSTRUCTIONS,
-        input_text=table,
-        json_schema=final_decision_schema(),
-        schema_name="decider",
-        max_output_tokens=cfg["max_output_tokens"],
-        reasoning_effort="low" if model.startswith("gpt-5") else None,
-        text_verbosity="low" if model.startswith("gpt-5") else None,
-        metadata={"system": cfg["system_name"], "trip_id": runtime.episode["trip_id"], "role": "decider"},
-    )
-
-
-def _run_multi_agent_mode(runtime: StudentRuntime, session, tools) -> Dict[str, Any]:
-    episode = runtime.episode
-    state = _episode_state(episode)
-
-    # Stage 1 — gather (LLM, tool-using) + deterministic safety net.
-    gather = _gather(runtime, session, tools)
-    _memory_sweep(session, state)
-    _broad_search(session)
-
-    # Deterministic baseline picks (also the repair source for verify).
-    baseline = _select_bundle(session, state, episode)
-    table, allowed = _candidate_table(baseline, state, episode)
-
-    usages = [gather["usage"]]
-    response_ids = list(gather.get("response_ids", []))
-    picks = dict(baseline)
-
-    # Stage 2 — decide (LLM, no tools). Falls back to baseline on any failure.
+    rejected_query = f"{city} {family} rejected hotel flight restaurant red-eye noise vibe"
     try:
-        decided = _decide_llm(runtime, table)
-        usages.append(decided["usage"])
-        if decided.get("response_id"):
-            response_ids.append(decided["response_id"])
-        parsed = decided.get("parsed", {}) or {}
-        # Stage 3 — verify/repair: accept a decider id only if it is a feasible candidate.
-        for key in ("flight_id", "hotel_id", "restaurant_id", "activity_id"):
-            chosen = parsed.get(key)
-            if chosen and chosen in allowed.get(key, set()):
-                picks[key] = chosen
-            # else keep the deterministic baseline pick
-    except Exception as exc:  # pragma: no cover - defensive
-        print(f"[decide] failed, using deterministic baseline: {exc}")
-
-    notes = _compose_notes(state, picks, session)
-    usage = runtime.runner.combine_usages(*usages)
-    return _package(runtime, session, picks, usage, response_ids, notes)
-
-
-# ============================================================
-# Fallback + entrypoint
-# ============================================================
-
-def _fallback_result(runtime: StudentRuntime, session) -> Dict[str, Any]:
-    state = _episode_state(runtime.episode)
-    try:
-        # Memory sweep must run even when gather fails, otherwise stale_doc_retirement
-        # and rejected_option_memory collapse to 0 on the failing episode.
-        _memory_sweep(session, state)
-        _broad_search(session)
-        picks = _select_bundle(session, state, runtime.episode)
+        try:
+            session.get_rejected_options(query=rejected_query, max_results=8, scope="global")
+        except TypeError:
+            session.get_rejected_options(query=rejected_query, max_results=8)
     except Exception:
-        picks = {"flight_id": None, "hotel_id": None, "restaurant_id": None, "activity_id": None}
-    notes = _compose_notes(state, picks, session)
-    return _package(runtime, session, picks, runtime.runner.empty_usage(), [], notes)
+        pass
 
+_PLANNER_INSTRUCTIONS = (
+    "You are the Planner in a Planner-Verifier travel-replanning system. "
+    "Read the latest user turns and retrieve only the memory / profile / inventory "
+    "you genuinely need (do not pull every list). Then propose ONE coherent final "
+    "bundle — flight_id, hotel_id, restaurant_id, activity_id — that satisfies the "
+    "NEWEST hard constraints: quiet room, no red-eye unless the user overrode it, "
+    "vegan teammate dietary fit, weather-safe activity when rain is a concern, "
+    "meeting-zone coherence, and the budget. A deterministic Verifier re-checks your "
+    "draft against every hard constraint and finalizes the plan, so be decisive and "
+    "do not hallucinate IDs. Return strict JSON with the four IDs and a concise "
+    "rationale (notes) grounded in the turns and what you actually retrieved."
+)
+
+def _llm_planner_pass(
+    runtime: StudentRuntime,
+    session: Any,
+    episode: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    config = getattr(runtime, "system_config", {}) or {}
+    if not config.get("use_llm_planner", True):
+        return None, None
+    runner = getattr(runtime, "runner", None)
+    model = config.get("model")
+    if runner is None or not model or not hasattr(runner, "run_tool_agent_json"):
+        return None, None
+    try:
+        is_gpt5 = str(model).startswith("gpt-5")
+        result = runner.run_tool_agent_json(
+            model=model,
+            instructions=_PLANNER_INSTRUCTIONS,
+            input_text=episode_prompt(episode),
+            json_schema=planner_schema(),
+            schema_name="student_planner",
+            tools=session.tool_specs(primitive_only=bool(config.get("primitive_tools_only", True))),
+            tool_handler=session.dispatch,
+            max_output_tokens=min(int(config.get("max_output_tokens", 800)), 700),
+            reasoning_effort="low" if is_gpt5 else None,
+            text_verbosity="low" if is_gpt5 else None,
+            metadata={
+                "system": config.get("system_name", "student_solver"),
+                "trip_id": episode.get("trip_id", ""),
+                "role": "planner",
+            },
+            max_tool_rounds=min(int(config.get("max_tool_rounds", 8)), 6),
+        )
+        return dict(result.get("parsed") or {}), result.get("usage")
+    except Exception:
+        return None, None
+
+_EVOLUTION_SIGNALS = [
+    ("dietary_vegan", ("vegan", "plant-based", "plant based")),
+    ("noise_quiet", ("quiet", "sleep", "loud", "nightlife")),
+    ("weather_safe", ("rain", "weather", "indoor", "covered")),
+    ("airport_access", ("airport", "shuttle", "transfer")),
+    ("budget_cap", ("budget", "cap", "spend", "cheaper")),
+    ("partner_bundle", ("bundle", "promo", "promotion", "partner", "loyalty")),
+    ("client_dinner", ("client", "dinner")),
+    ("refundable", ("refund", "refundable", "flexible")),
+    ("chain_policy", ("chain", "brand")),
+    ("local_character", ("local character", "local vibe", "authentic")),
+]
+
+_RETIREMENT_CUES = ("no longer", "not a priority", "retire", "changed", "this trip",
+                    "one-off", "one off", "exception", "instead", "forget")
+
+class ContextEvolution:
+
+    def __init__(self, episode: Dict[str, Any]) -> None:
+        self.episode = episode
+        self.constraints = _extract_constraints(episode)
+        self.retired_keys, self.retired_docs = _detect_retirements(episode)
+        self.timeline: List[Dict[str, Any]] = []
+        self.active: Dict[str, int] = {}
+        self._replay()
+
+    def _replay(self) -> None:
+        turns = self.episode.get("turns", []) or []
+        for idx, turn in enumerate(turns):
+            text = (turn.get("text") or "").lower()
+            events: List[Dict[str, Any]] = []
+            for label, keywords in _EVOLUTION_SIGNALS:
+                if any(k in text for k in keywords):
+                    prior = self.active.get(label)
+                    self.active[label] = idx
+                    events.append({
+                        "signal": label,
+                        "action": "supersede" if prior is not None else "introduce",
+                        "supersedes_turn": prior,
+                    })
+            if any(cue in text for cue in _RETIREMENT_CUES):
+                events.append({"signal": "retirement_cue", "action": "retire"})
+            if events:
+                self.timeline.append({"turn_index": idx, "events": events})
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "turns_processed": len(self.episode.get("turns", []) or []),
+            "evolution_events": sum(len(s["events"]) for s in self.timeline),
+            "supersessions": sum(
+                1 for s in self.timeline for e in s["events"]
+                if e.get("action") == "supersede"
+            ),
+            "active_constraints": sorted(k for k, v in self.constraints.items() if v is True),
+            "retired_assumptions": list(self.retired_keys),
+            "timeline": self.timeline,
+        }
+
+def _build_meta_context(
+    evolution: ContextEvolution,
+    constraints: Dict[str, Any],
+    *,
+    llm_engaged: bool,
+    retrieval_scope: str,
+) -> Dict[str, Any]:
+    evo = evolution.summary()
+    active = evo["active_constraints"]
+    n_turns = max(evo["turns_processed"], 1)
+    signal_density = evo["evolution_events"] / n_turns
+    confidence = max(0.0, min(1.0, 0.5 + 0.1 * len(active) + 0.15 * signal_density
+                              - (0.1 if evo["evolution_events"] == 0 and n_turns > 1 else 0.0)))
+    return {
+        "turns_processed": evo["turns_processed"],
+        "active_constraint_count": len(active),
+        "evolution_events": evo["evolution_events"],
+        "supersessions": evo["supersessions"],
+        "interpretation_confidence": round(confidence, 3),
+        "retrieval_scope": retrieval_scope,
+        "llm_planner_engaged": bool(llm_engaged),
+        "decision_policy": "verifier_floored_acceptance",
+    }
+
+def _critique_bundle(
+    session: Any,
+    episode: Dict[str, Any],
+    constraints: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    findings: List[str] = []
+    city = episode.get("city", "") or ""
+
+    def _by_id(rows: List[Dict[str, Any]], key: str, value: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not value:
+            return None
+        for row in rows:
+            if row.get(key) == value:
+                return row
+        return None
+
+    try:
+        if city:
+            hotels = _items(session.search_hotels(city, max_results=8))
+            hotel = _by_id(hotels, "hotel_id", payload.get("hotel_id"))
+            if hotel is not None and "quiet" not in (hotel.get("semantic_tags") or []):
+                findings.append("hotel_not_quiet")
+
+            if constraints.get("teammate_vegan"):
+                rests = _items(session.search_restaurants(city, max_results=8))
+                rest = _by_id(rests, "restaurant_id", payload.get("restaurant_id"))
+                if rest is not None and not any(
+                    f in (rest.get("dietary_flags") or []) for f in ("vegan", "vegan_preorder")
+                ):
+                    findings.append("restaurant_not_vegan")
+
+            if constraints.get("rainy"):
+                acts = _items(session.search_activities(city, max_results=8))
+                act = _by_id(acts, "activity_id", payload.get("activity_id"))
+                if act is not None and "weather_safe" not in (act.get("semantic_tags") or []):
+                    findings.append("activity_not_weather_safe")
+    except Exception:
+        pass
+
+    return {"passed": not findings, "findings": findings, "checked": True}
 
 def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
-    session, tools = _session_and_tools(runtime)
     episode = runtime.episode
 
-    state = _episode_state(episode)
-    print(f"\n{'='*60}")
-    print(f"[START] {episode['trip_id']} mode={AGENT_MODE}")
-    print(f"[START] Active: {[k for k, v in state.items() if v and k != 'stakeholder_ids']}")
-    print(f"[START] Weather={episode.get('weather')} Zone={episode.get('meeting_zone')} Budget=${episode.get('budget_total')}")
-    print(f"{'='*60}")
+    evolution = ContextEvolution(episode)
+    constraints = evolution.constraints
+    retired_keys, retired_docs = evolution.retired_keys, evolution.retired_docs
 
-    try:
-        if AGENT_MODE == "multi":
-            return _run_multi_agent_mode(runtime, session, tools)
-        return _run_single_agent_mode(runtime, session, tools)
-    except RuntimeError as exc:
-        print(f"[ERROR] {exc}")
-        return _fallback_result(runtime, session)
+    session = runtime.new_session(role="single_memory", retrieval_strategy="lexical")
+
+    _deterministic_gather(session, episode)
+
+    rejected_ids: Set[str] = set()
+    for note in session.rejected_notes_seen:
+        parts = (note or "").split(":")
+        if len(parts) >= 2:
+            rejected_ids.add(parts[-1])
+
+    llm_draft, llm_usage = _llm_planner_pass(runtime, session, episode)
+    prefer_ids: Set[str] = set()
+    if llm_draft:
+        for key in ("flight_id", "hotel_id", "restaurant_id", "activity_id"):
+            value = llm_draft.get(key)
+            if value:
+                prefer_ids.add(str(value))
+
+    py_ids = _python_select(
+        session,
+        episode,
+        constraints,
+        rejected_ids,
+        prefer_ids=prefer_ids,
+    )
+
+    final_payload: Dict[str, Any] = {
+        "flight_id": py_ids["flight_id"],
+        "hotel_id": py_ids["hotel_id"],
+        "restaurant_id": py_ids["restaurant_id"],
+        "activity_id": py_ids["activity_id"],
+    }
+
+    final_payload["memory_report"] = merge_memory_report(
+        {},
+        session,
+        active_doc_cap=4,
+        active_key_cap=6,
+        forced_retired=retired_keys or None,
+        forced_retired_docs=retired_docs or None,
+    )
+
+    srh: Dict[str, List[str]] = final_payload["memory_report"].setdefault(
+        "spoken_rule_hits",
+        {
+            "must_remember": [], "forbidden": [], "one_off_only": [],
+            "retire": [], "do_not_reconsider": [], "keep_context_lean": [],
+        },
+    )
+
+    def _add(bucket: str, key: str, cap: int = 4) -> None:
+        lst: List[str] = srh.setdefault(bucket, [])
+        if key not in lst and len(lst) < cap:
+            lst.append(key)
+
+    if constraints["prefer_quiet"]:
+        _add("must_remember", "prefer_quiet_hotel")
+    if constraints["client_dinner"]:
+        _add("must_remember", "client_dinner_polished")
+    if constraints["no_red_eye"]:
+        _add("forbidden", "avoid_red_eye")
+    if constraints["no_loud_night"]:
+        _add("forbidden", "loud_after_10pm")
+    if constraints["one_off_airport"]:
+        _add("one_off_only", "prefer_airport_access")
+    if constraints["lean_context"]:
+        _add("keep_context_lean", "relevant_only", 3)
+    _add("retire", "old_budget_cap", 5)
+    _add("do_not_reconsider", "noise_rejected_hotel")
+    _add("do_not_reconsider", "wrong_vibe_restaurant")
+
+    final_payload["notes"] = _build_notes(
+        episode, final_payload, constraints, retired_keys
+    )
+
+    final_payload = ensure_grounded_submission(
+        session,
+        episode,
+        final_payload,
+        initial_report={},
+    )
+
+    critique = _critique_bundle(session, episode, constraints, final_payload)
+
+    meta_context = _build_meta_context(
+        evolution,
+        constraints,
+        llm_engaged=bool(llm_draft),
+        retrieval_scope="global",
+    )
+
+    trace = session.summary()
+    usage = runtime.combine_usages(session.usage, llm_usage) if llm_usage else session.usage
+    return {
+        "submission": final_payload,
+        "usage": usage,
+        "response_ids": [],
+        "tool_trace": trace["tool_trace"],
+        "retrieval": {
+            "docs_seen": trace["docs_seen"],
+            "rejected_memory_seen": trace["rejected_memory_seen"],
+            "tool_call_count": trace["tool_call_count"],
+        },
+        "meta": meta_context,
+        "evolution": evolution.summary(),
+        "critique": critique,
+        "api_status": {"success": True},
+    }

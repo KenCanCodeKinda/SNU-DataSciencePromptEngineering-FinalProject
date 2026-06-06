@@ -1,0 +1,186 @@
+[
+  {
+    "name": "Full system (all 5 modules)",
+    "score": 100.0,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 1.0,
+      "stale_doc_retirement_rate": 1.0,
+      "rejected_option_memory_rate": 1.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 0,
+      "docs_seen": 538,
+      "rejected_seen": 160,
+      "meta_confidence_sum": 20.0,
+      "meta_count": 20
+    }
+  },
+  {
+    "name": "\u2212 Meta-Context Controller",
+    "score": 100.0,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 1.0,
+      "stale_doc_retirement_rate": 1.0,
+      "rejected_option_memory_rate": 1.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 0,
+      "docs_seen": 538,
+      "rejected_seen": 160,
+      "meta_confidence_sum": 0.0,
+      "meta_count": 0
+    }
+  },
+  {
+    "name": "\u2212 Context-Evolution module",
+    "score": 100.0,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 1.0,
+      "stale_doc_retirement_rate": 1.0,
+      "rejected_option_memory_rate": 1.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 0,
+      "supersessions": 0,
+      "critic_findings": 0,
+      "docs_seen": 538,
+      "rejected_seen": 160,
+      "meta_confidence_sum": 0.0,
+      "meta_count": 0
+    }
+  },
+  {
+    "name": "\u2212 Verifier-Critic self-audit",
+    "score": 100.0,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 1.0,
+      "stale_doc_retirement_rate": 1.0,
+      "rejected_option_memory_rate": 1.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 0,
+      "docs_seen": 538,
+      "rejected_seen": 160,
+      "meta_confidence_sum": 20.0,
+      "meta_count": 20
+    }
+  },
+  {
+    "name": "\u2212 Memory-Context Manager (no gather)",
+    "score": 83.5,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 0.566855,
+      "stale_doc_retirement_rate": 0.0,
+      "rejected_option_memory_rate": 0.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 0,
+      "docs_seen": 20,
+      "rejected_seen": 0,
+      "meta_confidence_sum": 20.0,
+      "meta_count": 20
+    }
+  },
+  {
+    "name": "\u2212 Global retrieval scope only",
+    "score": 97.79,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 0.9775,
+      "stale_doc_retirement_rate": 0.97452,
+      "rejected_option_memory_rate": 0.6499900000000001,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 0,
+      "docs_seen": 348,
+      "rejected_seen": 39,
+      "meta_confidence_sum": 20.0,
+      "meta_count": 20
+    }
+  },
+  {
+    "name": "\u2212 Retirement detection",
+    "score": 100.0,
+    "components": {
+      "hard_constraint_rate": 1.0,
+      "bundle_coherence_rate": 1.0,
+      "semantic_fit_rate": 1.0,
+      "exactish_rate": 1.0,
+      "update_handling_rate": 1.0,
+      "stale_doc_retirement_rate": 1.0,
+      "rejected_option_memory_rate": 1.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 0,
+      "docs_seen": 538,
+      "rejected_seen": 160,
+      "meta_confidence_sum": 20.0,
+      "meta_count": 20
+    }
+  },
+  {
+    "name": "\u2212 Verifier floor (naive greedy select)",
+    "score": 83.34,
+    "components": {
+      "hard_constraint_rate": 0.7467900000000001,
+      "bundle_coherence_rate": 0.85,
+      "semantic_fit_rate": 0.8800000000000001,
+      "exactish_rate": 0.3375,
+      "update_handling_rate": 1.0,
+      "stale_doc_retirement_rate": 1.0,
+      "rejected_option_memory_rate": 1.0,
+      "efficiency_score": 1.0
+    },
+    "diag": {
+      "evolution_events": 394,
+      "supersessions": 141,
+      "critic_findings": 4,
+      "docs_seen": 518,
+      "rejected_seen": 160,
+      "meta_confidence_sum": 20.0,
+      "meta_count": 20
+    }
+  }
+]

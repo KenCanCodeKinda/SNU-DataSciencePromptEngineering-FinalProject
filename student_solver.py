@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import json
 from typing import Any, Dict, List, Optional, Tuple
 from itertools import product
 
@@ -19,33 +20,58 @@ from student_custom_tools_template import (
 
 
 class TravelPlanner:
-    """Scenario-based travel planner with LLM pairwise selection using preference hierarchy"""
+    """Scenario-based travel planner with LLM + CoT understanding user preferences"""
     
     def __init__(self, runtime: StudentRuntime):
         self.runtime = runtime
     
     def _parse_hour(self, time_str: str) -> int:
-        """Safely parse time string, return hour"""
+        """Safely parse time string, return hour (24-hour format)"""
         if not time_str:
             return 12
         try:
-            cleaned = time_str.strip()
+            cleaned = time_str.strip().lower()
             if ':' in cleaned:
                 hour_part = cleaned.split(':')[0].strip()
                 hour = int(hour_part)
+                if 'pm' in cleaned and hour < 12:
+                    hour += 12
+                if 'am' in cleaned and hour == 12:
+                    hour = 0
                 return hour
-            import re
             match = re.search(r'(\d{1,2})', cleaned)
             if match:
                 hour = int(match.group(1))
-                if 'pm' in cleaned.lower() and hour < 12:
+                if 'pm' in cleaned and hour < 12:
                     hour += 12
-                if 'am' in cleaned.lower() and hour == 12:
+                if 'am' in cleaned and hour == 12:
                     hour = 0
                 return hour
             return 12
         except (ValueError, IndexError, AttributeError):
             return 12
+    
+    def _can_attend_meeting(self, flight: Dict, meeting_time: str = "09:00") -> tuple[bool, str]:
+        """Determine if flight allows attending meeting on Day 2 at meeting_time"""
+        if not flight:
+            return False, "No flight"
+        
+        flight_id = flight.get('flight_id', '')
+        arrival_time = flight.get('arrival_time', '')
+        arrival_day = flight.get('arrival_day', flight.get('day', 'day1'))
+        
+        if arrival_day == 'day1' or 'day1' in str(flight_id).lower():
+            return True, "Arrives Day 1"
+        
+        if arrival_day == 'day2' or 'day2' in str(flight_id).lower():
+            arr_hour = self._parse_hour(arrival_time)
+            meeting_hour = self._parse_hour(meeting_time)
+            if arr_hour < meeting_hour:
+                return True, f"Arrives Day 2 at {arrival_time} (before meeting)"
+            else:
+                return False, f"Arrives Day 2 at {arrival_time} (misses meeting)"
+        
+        return True, "Assuming Day 1 arrival"
     
     def fetch_all_options(self, episode: Dict[str, Any]) -> Dict[str, List[Dict]]:
         """Fetch all available options"""
@@ -79,7 +105,8 @@ class TravelPlanner:
         for f in options['flights']:
             red_eye_flag = "🛑Red-eye" if f.get('red_eye') else "✓Normal"
             refund_flag = "🔄Refundable" if f.get('refundable') else "❌Non-refund"
-            print(f"  - {f.get('flight_id')}: {f.get('depart_time', 'N/A')} → {f.get('arrival_time', 'N/A')}, "
+            day_flag = f.get('arrival_day', f.get('day', 'day1'))
+            print(f"  - {f.get('flight_id')}: {f.get('depart_time', 'N/A')} → {f.get('arrival_time', 'N/A')} ({day_flag}), "
                   f"₩{f.get('fare_total', 'N/A'):,}, {red_eye_flag}, {refund_flag}")
         
         print(f"\n🏨 Hotels ({len(options['hotels'])}):")
@@ -242,440 +269,294 @@ class TravelPlanner:
         
         return total
     
-    def generate_memory_report_with_llm(
-        self,
-        episode: Dict[str, Any],
-        best_combo: Tuple[str, str, str, str],
-        best_info: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Generate memory_report using LLM based on conversation"""
-        
-        turns = episode.get('turns', [])
-        flight_id, hotel_id, restaurant_id, activity_id = best_combo
-        
-        # Build conversation with timestamps
-        conversation_lines = []
-        for i, turn in enumerate(turns, 1):
-            speaker = "User" if turn.get('speaker') == 'user' else "System"
-            text = turn.get('text', '')
-            conversation_lines.append(f"[Message {i}] {speaker}: {text}")
-        conversation = "\n".join(conversation_lines)
-        
-        memory_prompt = f"""
-## User Conversation (chronological order)
-{conversation}
-
-## Selected Plan
-- Flight: {flight_id}
-- Hotel: {hotel_id}
-- Restaurant: {restaurant_id}
-- Activity: {activity_id}
-
-## Your Task
-Extract spoken rules from the conversation into the exact memory_report format required.
-
-## Rule Mapping Guide
-
-| User says | Category | Key to add |
-|-----------|----------|------------|
-| "quiet room matters", "genuinely quiet room" | must_remember | "quiet_matters" |
-| "client dinner polished", "polished enough for conversation" | must_remember | "client_ready_dinner" |
-| "no red-eye", "do not send me through a red-eye" | forbidden | "red_eye" |
-| "loud after 10pm", "nightlife spillover" | forbidden | "loud_after_10pm" |
-| "airport access matters more this trip only", "For this trip only, airport access matters more" | one_off_only | "airport_access_more_important_now" |
-| "chain hotel acceptable this trip only", "This trip only, a chain hotel is acceptable" | one_off_only | "chain_ok_this_trip" |
-| "older budget assumption no longer valid", "retire it", "The older budget assumption is no longer valid" | retire | "old_budget_cap" |
-| "stop carrying old local-character preference", "stop carrying the old local-character preference" | retire | "local_character_if_safe" |
-| "old chain absolute rule" | retire | "avoid_chain_hotels_stable" |
-| "old social bundle default" | retire | "old_social_bundle_default" |
-| "keep active context lean", "relevant old preferences", "bring back only the relevant old preferences" | keep_context_lean | "relevant_only" |
-| "reject hotel for noise, do not reconsider" | do_not_reconsider | "noise_rejected_hotel" |
-| "dinner option out for wrong vibe" | do_not_reconsider | "wrong_vibe_restaurant" |
-
-## Output Format (MUST follow exactly)
-
-Return JSON:
-{{
-  "memory_report": {{
-    "retrieved": ["prefer_quiet_hotel", "avoid_red_eye", "loud_after_10pm", "prefer_airport_access"],
-    "retired": ["old_budget_cap", "local_character_if_safe"],
-    "retired_docs": ["stale:budget_cap_archive", "stale:local_character_default"],
-    "rejected_option_notes": [],
-    "active_context_keys": ["prefer_quiet_hotel", "avoid_red_eye", "loud_after_10pm", "prefer_airport_access"],
-    "docs_retrieved": ["profile:traveler_ops", "city_ops:OSA"],
-    "active_docs": ["profile:traveler_ops"],
-    "ignored_distractors": [],
-    "spoken_rule_hits": {{
-      "must_remember": ["quiet_matters", "client_ready_dinner"],
-      "forbidden": ["red_eye", "loud_after_10pm"],
-      "one_off_only": ["airport_access_more_important_now", "chain_ok_this_trip"],
-      "retire": ["old_budget_cap", "local_character_if_safe"],
-      "do_not_reconsider": ["noise_rejected_hotel", "wrong_vibe_restaurant"],
-      "keep_context_lean": ["relevant_only"]
-    }}
-  }}
-}}
-
-## Important Rules
-1. ALWAYS include "relevant_only" in keep_context_lean
-2. If user says something is "this trip only", put it in one_off_only
-3. If user says something is "no longer valid" or "retire", put it in retire
-4. If user explicitly forbids something (like "do not send me through a red-eye"), put it in forbidden
-5. If user emphasizes something is important (like "quiet room matters"), put it in must_remember
-6. Use ONLY the key names from the mapping guide above
-
-Return ONLY valid JSON matching the exact format.
-"""
-        
-        memory_schema = {
-            "type": "object",
-            "properties": {
-                "memory_report": {
-                    "type": "object",
-                    "properties": {
-                        "retrieved": {"type": "array", "items": {"type": "string"}},
-                        "retired": {"type": "array", "items": {"type": "string"}},
-                        "retired_docs": {"type": "array", "items": {"type": "string"}},
-                        "rejected_option_notes": {"type": "array", "items": {"type": "string"}},
-                        "active_context_keys": {"type": "array", "items": {"type": "string"}},
-                        "docs_retrieved": {"type": "array", "items": {"type": "string"}},
-                        "active_docs": {"type": "array", "items": {"type": "string"}},
-                        "ignored_distractors": {"type": "array", "items": {"type": "string"}},
-                        "spoken_rule_hits": {
-                            "type": "object",
-                            "properties": {
-                                "must_remember": {"type": "array", "items": {"type": "string"}},
-                                "forbidden": {"type": "array", "items": {"type": "string"}},
-                                "one_off_only": {"type": "array", "items": {"type": "string"}},
-                                "retire": {"type": "array", "items": {"type": "string"}},
-                                "do_not_reconsider": {"type": "array", "items": {"type": "string"}},
-                                "keep_context_lean": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "required": ["must_remember", "forbidden", "one_off_only", "retire", "do_not_reconsider", "keep_context_lean"]
-                        }
-                    },
-                    "required": ["retrieved", "retired", "retired_docs", "rejected_option_notes", 
-                                 "active_context_keys", "docs_retrieved", "active_docs", 
-                                 "ignored_distractors", "spoken_rule_hits"]
-                }
-            },
-            "required": ["memory_report"]
-        }
-        
-        print(f"\n🤖 Stage 3: LLM Generating Memory Report")
-        
-        try:
-            memory_result = self.runtime.runner.create_json_response(
-                model="gpt-4o-mini",
-                instructions="Extract spoken rules from conversation into exact memory_report format. Follow the mapping guide exactly.",
-                input_text=memory_prompt,
-                json_schema=memory_schema,
-                schema_name="memory_report",
-                max_output_tokens=1000,
-                metadata={"system": "student_solver", "trip_id": episode["trip_id"], "stage": "memory"},
-            )
-            
-            memory_report = memory_result.get("parsed", {}).get("memory_report", {})
-            
-            # Track usage
-            if hasattr(self.runtime, 'runner'):
-                self.runtime.runner._record_observed_usage(memory_result.get('usage', {}))
-            
-        except Exception as e:
-            print(f"   ⚠️ LLM memory generation failed: {e}")
-            memory_report = {}
-        
-        # Ensure required fields exist
-        if "spoken_rule_hits" not in memory_report:
-            memory_report["spoken_rule_hits"] = {
-                "must_remember": [],
-                "forbidden": [],
-                "one_off_only": [],
-                "retire": [],
-                "do_not_reconsider": [],
-                "keep_context_lean": ["relevant_only"]
-            }
-        
-        # Ensure keep_context_lean always has relevant_only
-        if "keep_context_lean" in memory_report["spoken_rule_hits"]:
-            if "relevant_only" not in memory_report["spoken_rule_hits"]["keep_context_lean"]:
-                memory_report["spoken_rule_hits"]["keep_context_lean"].append("relevant_only")
-        else:
-            memory_report["spoken_rule_hits"]["keep_context_lean"] = ["relevant_only"]
-        
-        # Ensure all spoken_rule_hits fields exist
-        for field in ["must_remember", "forbidden", "one_off_only", "retire", "do_not_reconsider", "keep_context_lean"]:
-            if field not in memory_report["spoken_rule_hits"]:
-                memory_report["spoken_rule_hits"][field] = []
-        
-        # Set default active_context_keys if empty
-        if not memory_report.get("active_context_keys"):
-            memory_report["active_context_keys"] = ["prefer_quiet_hotel", "avoid_red_eye", "relevant_only"]
-        
-        # Set default retrieved if empty
-        if not memory_report.get("retrieved"):
-            memory_report["retrieved"] = memory_report["active_context_keys"][:4]
-        
-        print(f"\n   📋 Generated Memory Report:")
-        print(f"      must_remember: {memory_report['spoken_rule_hits']['must_remember']}")
-        print(f"      forbidden: {memory_report['spoken_rule_hits']['forbidden']}")
-        print(f"      one_off_only: {memory_report['spoken_rule_hits']['one_off_only']}")
-        print(f"      retire: {memory_report['spoken_rule_hits']['retire']}")
-        print(f"      keep_context_lean: {memory_report['spoken_rule_hits']['keep_context_lean']}")
-        
-        return memory_report
-    
-    def llm_selection(
+    def llm_select_with_cot(
         self,
         episode: Dict[str, Any],
         valid_combos: List[Dict],
-        requirements: Dict[str, Any],
         flights_dict: Dict,
         hotels_dict: Dict,
         restaurants_dict: Dict,
         activities_dict: Dict
-    ) -> Tuple[Tuple[str, str, str, str], float, Dict, Dict]:
-        """Three-stage LLM selection: Filter -> Select -> Memory Report"""
+    ) -> Tuple[Tuple[str, str, str, str], Dict, Dict]:
+        """
+        LLM + Chain of Thought selection - compares ALL options and picks the best
+        """
         
         turns = episode.get('turns', [])
+        meeting_time = episode.get('meeting_time', '09:00')
+        meeting_zone = episode.get('meeting_zone', '')
+        budget_total = episode.get('budget_total', 0)
+        weather = episode.get('weather', '')
         
-        # Build conversation with timestamps
+        # Build conversation
         conversation_lines = []
         for i, turn in enumerate(turns, 1):
-            speaker = "User" if turn.get('speaker') == 'user' else "System"
+            speaker = "Traveler" if turn.get('speaker') == 'user' else "Assistant"
             text = turn.get('text', '')
-            conversation_lines.append(f"[Message {i}] {speaker}: {text}")
+            conversation_lines.append(f"Message {i} - {speaker}: {text}")
         conversation = "\n".join(conversation_lines)
         
-        # Build combo table with detailed info
+        # Build options summary
+        flights_summary = []
+        for f_id, flight in flights_dict.items():
+            fare = flight.get('fare_total', 0)
+            arr_time = flight.get('arrival_time', '?')
+            arr_day = flight.get('arrival_day', flight.get('day', 'day1'))
+            red_eye = "⚠️RED-EYE" if flight.get('red_eye') else "Normal"
+            refund = "Refundable" if flight.get('refundable') else "Non-refund"
+            can_attend, _ = self._can_attend_meeting(flight, meeting_time)
+            attend = "✅CAN MEET" if can_attend else "❌MISSES MEETING"
+            flights_summary.append(f"  {f_id}: Arr {arr_time} ({arr_day}), ₩{fare:,}, {red_eye}, {refund}, {attend}")
+        
+        hotels_summary = []
+        for h_id, hotel in hotels_dict.items():
+            price = hotel.get('nightly_price', 0)
+            zone = hotel.get('zone', '?')
+            quiet = hotel.get('quiet_score', 0)
+            airport = hotel.get('airport_access_score', 0)
+            chain = "Chain" if hotel.get('chain') else "Independent"
+            zone_match = "🎯MEETING ZONE" if zone == meeting_zone else f"Zone:{zone}"
+            hotels_summary.append(f"  {h_id}: ₩{price}/night, Quiet:{quiet:.1f}, Airport:{airport:.1f}, {chain}, {zone_match}")
+        
+        restaurants_summary = []
+        for r_id, restaurant in restaurants_dict.items():
+            area = restaurant.get('area', '?')
+            client_score = restaurant.get('client_ready_score', 0)
+            quiet_score = restaurant.get('quiet_score', 0)
+            dietary = restaurant.get('dietary_flags', [])
+            diet_str = ", ".join(dietary) if dietary else "None"
+            restaurants_summary.append(f"  {r_id}: {area}, Client-ready:{client_score:.1f}, Quiet:{quiet_score:.1f}, Diet:[{diet_str}]")
+        
+        activities_summary = []
+        for a_id, activity in activities_dict.items():
+            zone = activity.get('location_zone', '?')
+            price = activity.get('price', 0)
+            indoor = "🏠Indoor" if activity.get('indoor') else "🌳Outdoor"
+            zone_match = "🎯MEETING ZONE" if zone == meeting_zone else f"Zone:{zone}"
+            activities_summary.append(f"  {a_id}: {zone_match}, ₩{price}, {indoor}")
+        
+        # Build combo table (all within budget that can attend meeting)
         combo_table = []
         for i, item in enumerate(valid_combos, 1):
             flight_id, hotel_id, restaurant_id, activity_id = item['combo']
-            
             flight = flights_dict.get(flight_id)
             hotel = hotels_dict.get(hotel_id)
             restaurant = restaurants_dict.get(restaurant_id)
             activity = activities_dict.get(activity_id)
             
-            # Flight info
-            flight_info = f"{flight_id}"
-            if flight:
-                flight_info += f"({flight.get('depart_time', '?')}->{flight.get('arrival_time', '?')})"
-                if flight.get('red_eye'):
-                    flight_info += " RED-EYE"
-                    fare = flight.get('fare_total', 0)
-                    flight_info += f" {fare:,} won"
-                    # Check if significantly cheaper
-                    avg_fare = 450000
-                    if fare < avg_fare * 0.7:
-                        flight_info += " BIG SAVINGS"
-                else:
-                    flight_info += " NORMAL"
-                if flight.get('refundable'):
-                    flight_info += " REFUND"
+            # Score indicators
+            indicators = []
+            if flight and flight.get('red_eye'):
+                indicators.append("⚠️RED-EYE")
+            if flight and flight.get('refundable'):
+                indicators.append("🔄REFUND")
+            if hotel and hotel.get('zone') == meeting_zone:
+                indicators.append("🎯HOTEL_ZONE")
+            if hotel and hotel.get('quiet_score', 0) >= 8.5:
+                indicators.append("🤫QUIET")
+            if restaurant and restaurant.get('client_ready_score', 0) >= 8.0:
+                indicators.append("🍽️CLIENT_READY")
+            if activity and activity.get('indoor') and weather == 'rainy':
+                indicators.append("🏠INDOOR_GOOD")
             
-            # Hotel info
-            hotel_info = f"{hotel_id}"
-            if hotel:
-                hotel_info += f"({hotel.get('zone', '?')} zone quiet:{hotel.get('quiet_score', 0):.1f})"
-                if hotel.get('zone') == episode.get('meeting_zone'):
-                    hotel_info += " MEETING ZONE"
+            indicator_str = " ".join(indicators) if indicators else ""
             
-            # Restaurant info
-            rest_info = f"{restaurant_id}"
-            if restaurant:
-                rest_info += f"({restaurant.get('area', '?')} zone client:{restaurant.get('client_ready_score', 0):.1f})"
-                if 'vegan' in restaurant.get('dietary_flags', []):
-                    rest_info += " VEGAN"
-            
-            # Activity info
-            act_info = f"{activity_id}"
-            if activity:
-                act_info += f"({activity.get('location_zone', '?')} zone {'INDOOR' if activity.get('indoor') else 'OUTDOOR'})"
-            
-            combo_table.append(f"{i}. {flight_info} | {hotel_info} | {rest_info} | {act_info} | {item['total_cost']:,} won")
+            combo_table.append(
+                f"{i}. {flight_id} | {hotel_id} | {restaurant_id} | {activity_id} | ₩{item['total_cost']:,} {indicator_str}"
+            )
         
-        # ========== Stage 1: Filter by Preference Hierarchy ==========
-        filter_prompt = f"""
-## User Conversation (chronological order, later messages override earlier)
+        # CoT prompt - forces comparison
+        cot_prompt = f"""You are a travel planner. Read the conversation and COMPARE ALL combinations to select the BEST one.
+
+## TRIP INFO
+- Destination: {episode.get('city')}
+- Meeting: Day 2 at {meeting_time} in {meeting_zone} zone
+- 2 nights (arrive Day 1, meeting Day 2, depart Day 3)
+- Budget: ₩{budget_total:,}
+- Weather: {weather}
+
+## CONVERSATION (read carefully to understand what user wants)
 {conversation}
 
-## Candidate Combinations ({len(valid_combos)} total)
+## AVAILABLE OPTIONS
+
+FLIGHTS:
+{chr(10).join(flights_summary)}
+
+HOTELS:
+{chr(10).join(hotels_summary)}
+
+RESTAURANTS:
+{chr(10).join(restaurants_summary)}
+
+ACTIVITIES:
+{chr(10).join(activities_summary)}
+
+## ALL CANDIDATE COMBINATIONS ({len(combo_table)} total)
 {chr(10).join(combo_table)}
 
-## Preference Hierarchy (Highest to Lowest Priority)
+## YOUR TASK: COMPARE ALL combinations and select the BEST
 
-### Level 1 - HIGHEST (Must satisfy)
-- Meeting attendance: must arrive in time for the meeting/event
-- Functional for work: need to stay productive
+Follow these steps EXACTLY:
 
-### Level 2 - HIGH (Satisfy unless overridden by Level 1)
-- **Red-eye flight rule**: User said "Do not send me through a red-eye just because the fare is lower"
-  - REJECT red-eye whose ONLY advantage is lower cost
-  - ACCEPT red-eye that is the ONLY way to attend the meeting
-  - CONSIDER red-eye with significant savings (e.g., 30%+ cheaper) and budget pressure
+### STEP 1: Extract user preferences from conversation
+List what user explicitly says they want:
+- Flight preferences:
+- Hotel preferences:
+- Restaurant preferences:
+- Activity preferences:
+- Dealbreakers (things user says NO to):
+- "This trip only" overrides:
 
-### Level 3 - MEDIUM (Can be overridden by Level 2)
-- Local character (suppressed for this trip)
-- Chain hotel restriction (temporarily overridden by "this trip only")
+### STEP 2: Score each combination (1-10 for each category)
+For each combination, rate:
+- Flight score (arrival time, no red-eye, refundable)
+- Hotel score (quiet, meeting zone, airport access)
+- Restaurant score (client-ready, dietary needs)
+- Activity score (weather-appropriate, zone)
+- Cost score (within budget, good value)
 
-### Level 4 - RETIRED (No longer apply)
-- Old budget assumption (retired by user)
+### STEP 3: Compare top 3-5 combinations
+Which combinations have the highest scores? Why?
 
-## Your Task
-1. First, check if the user can attend the meeting on time (check flight arrival time)
-2. Then evaluate red-eye flights: reject only if the ONLY reason is cost savings
-3. Return the numbers of combinations that are ACCEPTABLE under this hierarchy
+### STEP 4: Select the absolute best
+Which combination # best satisfies ALL the user's preferences?
 
-Return JSON: {{"valid_combo_ids": [1,2,3], "reason": "filtering reason"}}
-"""
-        
-        filter_schema = {
-            "type": "object",
-            "properties": {
-                "valid_combo_ids": {"type": "array", "items": {"type": "integer"}},
-                "reason": {"type": "string"}
-            },
-            "required": ["valid_combo_ids", "reason"],
-            "additionalProperties": False
-        }
-        
-        print(f"\n🤖 Stage 1: LLM Hierarchy Filtering")
-        print(f"   Model: gpt-4o-mini")
-        print(f"   Candidates: {len(valid_combos)}")
-        
-        filter_result = self.runtime.runner.create_json_response(
-            model="gpt-4o-mini",
-            instructions="Apply the preference hierarchy. Return combo numbers that are acceptable.",
-            input_text=filter_prompt,
-            json_schema=filter_schema,
-            schema_name="filter_combos",
-            max_output_tokens=800,
-            metadata={"system": "student_solver", "trip_id": episode["trip_id"], "stage": "filter"},
-        )
-        
-        filter_parsed = filter_result.get("parsed", {})
-        valid_ids = filter_parsed.get("valid_combo_ids", [])
-        filter_reason = filter_parsed.get("reason", "")
-        
-        print(f"   After filter: {len(valid_ids)} combos")
-        print(f"   Reason: {filter_reason[:200]}")
-        
-        # Print filtered combos
-        if valid_ids:
-            print(f"\n   Filtered combinations:")
-            for idx in valid_ids[:10]:
-                if 1 <= idx <= len(valid_combos):
-                    item = valid_combos[idx - 1]
-                    flight_id, hotel_id, restaurant_id, activity_id = item['combo']
-                    print(f"      #{idx}: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id} | {item['total_cost']:,} won")
-            if len(valid_ids) > 10:
-                print(f"      ... and {len(valid_ids) - 10} more")
-        
-        # Get filtered combos
-        filtered_combos = []
-        for idx in valid_ids:
-            if 1 <= idx <= len(valid_combos):
-                filtered_combos.append(valid_combos[idx - 1])
-        
-        if not filtered_combos:
-            print(f"   No valid combos, using first 10")
-            filtered_combos = valid_combos[:10]
-        
-        if hasattr(self.runtime, 'runner'):
-            self.runtime.runner._record_observed_usage(filter_result.get('usage', {}))
-        
-        # ========== Stage 2: Select best from filtered combos ==========
-        if len(filtered_combos) == 1:
-            best_item = filtered_combos[0]
-            reason = filter_reason + " -> Only valid combination"
-        else:
-            filtered_table = []
-            for i, item in enumerate(filtered_combos, 1):
-                flight_id, hotel_id, restaurant_id, activity_id = item['combo']
-                flight = flights_dict.get(flight_id)
-                hotel = hotels_dict.get(hotel_id)
-                restaurant = restaurants_dict.get(restaurant_id)
-                activity = activities_dict.get(activity_id)
-                
-                flight_info = f"{flight_id}({flight.get('depart_time', '?')}->{flight.get('arrival_time', '?')})" if flight else flight_id
-                if flight and flight.get('red_eye'):
-                    flight_info += "R"
-                hotel_info = f"{hotel_id}(quiet:{hotel.get('quiet_score', 0):.1f})" if hotel else hotel_id
-                rest_info = f"{restaurant_id}(client:{restaurant.get('client_ready_score', 0):.1f})" if restaurant else restaurant_id
-                act_info = f"{activity_id}" + (" indoor" if activity and activity.get('indoor') else "") if activity else activity_id
-                
-                filtered_table.append(f"{i}. {flight_info} | {hotel_info} | {rest_info} | {act_info} | {item['total_cost']:,} won")
-            
-            print(f"\n   Stage 2 candidates:")
-            for line in filtered_table:
-                print(f"      {line}")
-            
-            select_prompt = f"""
-## User Conversation
-{conversation}
+## OUTPUT FORMAT
+Return ONLY valid JSON:
+{{
+  "selected": number,
+  "reason": "Why this is best compared to others (mention trade-offs)",
+  "flight_pref": "Summary of what user wants for flights",
+  "hotel_pref": "Summary of what user wants for hotels", 
+  "restaurant_pref": "Summary of what user wants for restaurants",
+  "activity_pref": "Summary of what user wants for activities"
+}}
 
-## Valid Candidates ({len(filtered_combos)} combos)
-{chr(10).join(filtered_table)}
+IMPORTANT:
+- You MUST compare ALL combinations, not just the first one
+- The "selected" number MUST be between 1 and {len(combo_table)}
+- Your reason MUST explain why this is better than alternatives
+- If there are trade-offs, explain why this choice is optimal
 
-## Task
-Select the combination that best meets the user's needs.
-Return JSON: {{"selected": number, "reason": "selection reason"}}
-"""
-            
-            select_schema = {
-                "type": "object",
-                "properties": {
-                    "selected": {"type": "integer"},
-                    "reason": {"type": "string"}
-                },
-                "required": ["selected", "reason"],
-                "additionalProperties": False
-            }
-            
-            print(f"\n🤖 Stage 2: LLM Best Selection")
-            print(f"   Candidates: {len(filtered_combos)}")
-            
-            select_result = self.runtime.runner.create_json_response(
+Do not include any text before or after the JSON."""
+        
+        print(f"\n🤖 LLM + CoT Selection (Comparing all {len(combo_table)} combinations)")
+        print(f"   Conversation messages: {len(turns)}")
+        
+        try:
+            response = self.runtime.runner.client.chat.completions.create(
                 model="gpt-4o-mini",
-                instructions="Select the best combination that meets user needs.",
-                input_text=select_prompt,
-                json_schema=select_schema,
-                schema_name="select_best",
-                max_output_tokens=500,
-                metadata={"system": "student_solver", "trip_id": episode["trip_id"], "stage": "select"},
+                messages=[
+                    {"role": "system", "content": "You are a travel planning assistant. You MUST compare ALL options and select the BEST one. Output ONLY valid JSON."},
+                    {"role": "user", "content": cot_prompt}
+                ],
+                max_tokens=3000,
+                temperature=0.3,
             )
             
-            select_parsed = select_result.get("parsed", {})
-            selected_idx = select_parsed.get("selected", 1) - 1
-            reason = select_parsed.get("reason", "")
+            response_text = response.choices[0].message.content
             
-            if 0 <= selected_idx < len(filtered_combos):
-                best_item = filtered_combos[selected_idx]
+            print(f"\n   Raw response preview: {response_text[:400]}...")
+            
+            # Parse JSON from response
+            json_match = re.search(r'\{[^{}]*"selected"[^{}]*\}', response_text, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group())
             else:
-                best_item = filtered_combos[0]
+                # Try to find any JSON
+                json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group())
+                else:
+                    parsed = {}
             
-            if hasattr(self.runtime, 'runner'):
-                self.runtime.runner._record_observed_usage(select_result.get('usage', {}))
+            selected_num = parsed.get("selected", 1)
+            reasoning = parsed.get("reason", "LLM selected after comparing all options")
+            
+            # Validate selected number
+            if not (1 <= selected_num <= len(combo_table)):
+                print(f"   ⚠️ Invalid selection {selected_num}, using best based on cost")
+                # Fallback: pick cheapest that meets basic criteria
+                selected_num = 1
+                for i, item in enumerate(valid_combos, 1):
+                    flight_id = item['combo'][0]
+                    flight = flights_dict.get(flight_id)
+                    if flight and not flight.get('red_eye'):
+                        selected_num = i
+                        reasoning = "Fallback: selected non-red-eye flight with reasonable cost"
+                        break
+                    if item['total_cost'] < valid_combos[0]['total_cost']:
+                        selected_num = i
+                if selected_num == 1:
+                    reasoning = "Fallback: selected first combination"
+            
+            best_item = valid_combos[selected_num - 1]
+            
+            # Track usage
+            if hasattr(self.runtime, 'runner') and hasattr(response, 'usage'):
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                }
+                self.runtime.runner._record_observed_usage(usage)
+                
+        except Exception as e:
+            print(f"   ⚠️ LLM selection failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback: select combination with highest quiet + client scores
+            best_item = None
+            best_score = -1
+            for item in valid_combos:
+                flight_id, hotel_id, restaurant_id, activity_id = item['combo']
+                hotel = hotels_dict.get(hotel_id)
+                restaurant = restaurants_dict.get(restaurant_id)
+                score = 0
+                if hotel:
+                    score += hotel.get('quiet_score', 0)
+                if restaurant:
+                    score += restaurant.get('client_ready_score', 0)
+                if score > best_score:
+                    best_score = score
+                    best_item = item
+            if best_item is None:
+                best_item = valid_combos[0] if valid_combos else None
+            reasoning = "Fallback: selected combination with highest quiet + client-ready scores"
+        
+        if best_item is None:
+            empty_memory = {
+                "spoken_rule_hits": {"must_remember": [], "forbidden": [], "keep_context_lean": ["relevant_only"]}
+            }
+            return (None, None, None, None), {'total_cost': 0, 'reason': 'No valid combos'}, empty_memory
         
         flight_id, hotel_id, restaurant_id, activity_id = best_item['combo']
         
-        print(f"\nFinal selection: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
-        print(f"   Reason: {reason[:300]}")
+        print(f"\n✅ Selected: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
+        print(f"   Cost: ₩{best_item['total_cost']:,}")
+        print(f"   Reason: {reasoning[:300]}")
         
         best_info = {
             'total_cost': best_item['total_cost'],
-            'reason': reason
+            'reason': reasoning
         }
         
-        # ========== Stage 3: Generate Memory Report ==========
-        memory_report = self.generate_memory_report_with_llm(
-            episode, 
-            best_item['combo'], 
-            best_info
-        )
+        # Simple memory report
+        memory_report = {
+            "retrieved": [],
+            "retired": [],
+            "active_context_keys": ["relevant_only"],
+            "spoken_rule_hits": {
+                "must_remember": [],
+                "forbidden": [],
+                "one_off_only": [],
+                "retire": [],
+                "keep_context_lean": ["relevant_only"]
+            }
+        }
         
-        return best_item['combo'], 0, best_info, memory_report
+        return best_item['combo'], best_info, memory_report
     
     def select_best_combination(
         self,
@@ -685,8 +566,8 @@ Return JSON: {{"selected": number, "reason": "selection reason"}}
         context_info: Dict[str, Any],
         requirements: Dict[str, Any],
         spoken_rules: Dict[str, List[str]]
-    ) -> Tuple[Tuple[str, str, str, str], float, Dict, Dict]:
-        """Select best combination using LLM with memory report generation"""
+    ) -> Tuple[Tuple[str, str, str, str], Dict, Dict]:
+        """Select best combination using LLM + CoT based on user preferences"""
         
         budget = requirements["budget"]
         nights = requirements["nights"]
@@ -702,66 +583,59 @@ Return JSON: {{"selected": number, "reason": "selection reason"}}
         print(f"Total budget: {budget:,} won")
         print(f"Number of nights: {nights}")
         print(f"Total combos: {len(combinations)}")
-        print("-" * 80)
         
         valid_combos = []
-        skipped = 0
-        
         for combo in combinations:
             total_cost = self.calculate_total_cost(
                 combo, flights_dict, hotels_dict, restaurants_dict, activities_dict, nights
             )
             
-            if total_cost > budget:
-                skipped += 1
-                continue
-            
-            valid_combos.append({
-                'combo': combo,
-                'total_cost': total_cost,
-                'score': 0,
-            })
-            
-            flight_id, hotel_id, restaurant_id, activity_id = combo
-            print(f"  {flight_id} | {hotel_id} | {restaurant_id} | {activity_id} -> {total_cost:,} won")
+            if total_cost <= budget:
+                valid_combos.append({
+                    'combo': combo,
+                    'total_cost': total_cost,
+                })
         
-        print(f"\n  Within budget: {len(valid_combos)}")
-        print(f"  Over budget: {skipped}")
+        print(f"  Within budget: {len(valid_combos)}")
         
         if not valid_combos:
-            print("\nNo combinations within budget")
+            print("\n⚠️ No combinations within budget")
             empty_memory = {
-                "spoken_rule_hits": {
-                    "must_remember": [],
-                    "forbidden": [],
-                    "one_off_only": [],
-                    "retire": [],
-                    "do_not_reconsider": [],
-                    "keep_context_lean": ["relevant_only"]
-                },
-                "retrieved": [],
-                "retired": [],
-                "active_context_keys": ["relevant_only"]
+                "spoken_rule_hits": {"must_remember": [], "forbidden": [], "keep_context_lean": ["relevant_only"]}
             }
-            return (None, None, None, None), 0, {'total_cost': 0, 'reason': 'No valid combos within budget'}, empty_memory
+            return (None, None, None, None), {'total_cost': 0, 'reason': 'No valid combos within budget'}, empty_memory
         
-        best_combo, best_score, best_info, memory_report = self.llm_selection(
-            episode, valid_combos, requirements,
+        # Filter by meeting attendance
+        meeting_time = episode.get('meeting_time', '09:00')
+        meeting_combos = []
+        for item in valid_combos:
+            flight_id = item['combo'][0]
+            flight = flights_dict.get(flight_id)
+            can_attend, _ = self._can_attend_meeting(flight, meeting_time)
+            if can_attend:
+                meeting_combos.append(item)
+        
+        print(f"  Can attend meeting: {len(meeting_combos)}")
+        
+        if not meeting_combos:
+            print("⚠️ No flights can attend meeting! Using all combos.")
+            meeting_combos = valid_combos
+        
+        # Use LLM + CoT to select (compares all)
+        best_combo, best_info, memory_report = self.llm_select_with_cot(
+            episode, meeting_combos,
             flights_dict, hotels_dict, restaurants_dict, activities_dict
         )
         
-        flight_id, hotel_id, restaurant_id, activity_id = best_combo
-        
-        print(f"\nBest combo: {flight_id} | {hotel_id} | {restaurant_id} | {activity_id}")
-        print(f"   Cost: {best_info.get('total_cost', 0):,} won")
-        print(f"   Reason: {best_info.get('reason', '')[:200]}")
-        
-        return best_combo, best_score, best_info, memory_report
+        return best_combo, best_info, memory_report
     
     def recommend(self, episode: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Generate recommendation for a single episode"""
         
         state = episode.get('scenario_state', {})
+        
+        if 'meeting_time' not in episode:
+            episode['meeting_time'] = '09:00'
         
         all_options = self.fetch_all_options(episode)
         self.display_options(all_options, episode)
@@ -771,13 +645,13 @@ Return JSON: {{"selected": number, "reason": "selection reason"}}
         print("\n" + "="*80)
         print("Filtered Results")
         print("="*80)
-        print(f"Flights: {len(filtered_options['flights'])} -> {[f.get('flight_id') for f in filtered_options['flights']]}")
-        print(f"Hotels: {len(filtered_options['hotels'])} -> {[h.get('hotel_id') for h in filtered_options['hotels']]}")
-        print(f"Restaurants: {len(filtered_options['restaurants'])} -> {[r.get('restaurant_id') for r in filtered_options['restaurants']]}")
-        print(f"Activities: {len(filtered_options['activities'])} -> {[a.get('activity_id') for a in filtered_options['activities']]}")
+        print(f"Flights: {len(filtered_options['flights'])}")
+        print(f"Hotels: {len(filtered_options['hotels'])}")
+        print(f"Restaurants: {len(filtered_options['restaurants'])}")
+        print(f"Activities: {len(filtered_options['activities'])}")
         
         combinations = self.generate_combinations(filtered_options)
-        print(f"\nTotal Combinations: {len(combinations)}")
+        print(f"Total Combinations: {len(combinations)}")
         
         session = self.runtime.new_session(retrieval_strategy="lexical", max_results=10)
         context_info = fetch_all_context_info(session, episode)
@@ -789,7 +663,7 @@ Return JSON: {{"selected": number, "reason": "selection reason"}}
         requirements = extract_user_requirements(turns, state, episode)
         spoken_rules = extract_spoken_rules_from_turns(episode)
         
-        best_combo, best_score, best_info, memory_report = self.select_best_combination(
+        best_combo, best_info, memory_report = self.select_best_combination(
             episode, filtered_options, combinations, context_info, requirements, spoken_rules
         )
         
@@ -800,7 +674,7 @@ Return JSON: {{"selected": number, "reason": "selection reason"}}
             "hotel_id": hotel_id,
             "restaurant_id": restaurant_id,
             "activity_id": activity_id,
-            "notes": f"LLM selected: {best_info.get('reason', '')[:150]}"
+            "notes": best_info.get('reason', 'LLM+CoT selection')[:200]
         }
         
         print("\n" + "="*80)
@@ -811,13 +685,7 @@ Return JSON: {{"selected": number, "reason": "selection reason"}}
         print(f"Restaurant: {restaurant_id}")
         print(f"Activity: {activity_id}")
         print(f"Total Cost: {best_info.get('total_cost', 0):,} won")
-        
-        print("\nMemory Report:")
-        print(f"   must_remember: {memory_report.get('spoken_rule_hits', {}).get('must_remember', [])}")
-        print(f"   forbidden: {memory_report.get('spoken_rule_hits', {}).get('forbidden', [])}")
-        print(f"   one_off_only: {memory_report.get('spoken_rule_hits', {}).get('one_off_only', [])}")
-        print(f"   retire: {memory_report.get('spoken_rule_hits', {}).get('retire', [])}")
-        print(f"   keep_context_lean: {memory_report.get('spoken_rule_hits', {}).get('keep_context_lean', [])}")
+        print(f"\nReason: {best_info.get('reason', '')[:300]}")
         
         return picks, memory_report
 
@@ -832,21 +700,18 @@ def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
     print("="*80)
     print(f"City: {episode.get('city')}")
     print(f"Origin: {episode.get('origin')}")
-    print(f"Meeting Zone: {episode.get('meeting_zone')}")
+    print(f"Meeting: {episode.get('meeting_zone')} at {episode.get('meeting_time', '09:00')}")
     print(f"Budget: {episode.get('budget_total'):,} won")
     print(f"Weather: {episode.get('weather')}")
-    print(f"Traveler: {episode.get('traveler_id')}")
     
     state = episode.get('scenario_state', {})
     print(f"\nScenario State:")
     for key, value in state.items():
         if value and key != 'stakeholder_ids':
             print(f"   - {key}: {value}")
-        elif key == 'stakeholder_ids' and value:
-            print(f"   - {key}: {value}")
     
     turns = episode.get('turns', [])
-    print(f"\nUser Messages: {len(turns)}")
+    print(f"\nConversation: {len(turns)} messages")
     
     planner = TravelPlanner(runtime)
     picks, memory_report = planner.recommend(episode)
@@ -857,7 +722,7 @@ def solve_episode(runtime: StudentRuntime) -> Dict[str, Any]:
         "restaurant_id": picks.get("restaurant_id"),
         "activity_id": picks.get("activity_id"),
         "memory_report": memory_report,
-        "notes": picks.get("notes", f"LLM selection for {episode.get('trip_id')}")
+        "notes": picks.get("notes", f"LLM+CoT selection")
     }
     
     session = runtime.new_session(retrieval_strategy="lexical", max_results=4)

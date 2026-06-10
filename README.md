@@ -97,16 +97,31 @@ Soft = semantic_fit 9.88 + exactish 4.56. Replanning = update_handling 15.00 + s
 
 ## Score logs
 
-Three separate logs exist, on two different scales — don't compare across them.
+Every run under `runs/` records its full evaluator summary in `llm_run_trace.jsonl`, so the entire
+score history is recoverable on the **official /100** with no re-running of paid evals. Regenerate any
+table below with `python _score_history.py` (add `--md` for these markdown tables).
 
-### 1. Live evaluation (real LLM, official /100)
+The project scorer changed once mid-development, giving two `/100` scales that can't be mixed: the
+**current** 45/5/15/25/10 scale (sections 1–2) and an **older** 40/30/20/10 rubric (section 3).
 
-The authoritative numbers. Produced by `run_llm_baselines.py` against `episodes_public_example.json`.
+### 1. Full 20-episode evals on the current official /100
 
-| Run | Episodes | Model | Official /100 | decision_quality | cost_usd | tool_calls | API |
-|---|---:|---|---:|---:|---:|---:|---|
-| `runs/public20` (2026-06-10) | 20 | gpt-5.4-nano | **96.23** | 0.805 | 0.041857 | 8.70 | all ok |
-| `runs/smoke_test` (2026-06-10) | 2 | gpt-5.4-nano | 100.00 | 0.808 | 0.004098 | 8.50 | all ok |
+All scored by the current evaluator (`student_view.official_score_100` pulled straight from each trace),
+so these are directly comparable to the 96.23 headline. Sorted by score.
+
+| Run | /100 | hard | stale_doc | cost_usd | What changed |
+|---|---:|---:|---:|---:|---|
+| `public20` (**current**) | **96.23** | 0.992 | 1.000 | 0.041857 | • Shipped solver: the joint budget-aware bundle selector now lands a feasible, high-fit 4-item bundle on nearly every episode — `hard` 0.88→**0.99**, `exactish` 0.63→**0.91**, `coherence` back to **1.0**.<br>• Replanning bucket maxed (`stale_doc`→1.0); the only points left are efficiency (7.17/10, all cost). |
+| `step4b_coherence` | 86.49 | 0.883 | 0.975 | 0.032421 | • Coherence-focused tuning pass on gpt-5.4-nano; best `exactish` (0.625) of the dev branch.<br>• `bundle_coherence` still stuck at 0.85 — the meeting-zone bonus wasn't landing yet (fixed in `public20`). |
+| `step3_model_swap` | 86.21 | 0.863 | 0.975 | 0.019554 | • Swapped the generator to the cheaper **gpt-5-nano** → cost ≈halved to $0.0196 (lowest of the full runs).<br>• No quality regression — same score for less money, i.e. the efficiency lever the headline run still leaves unused. |
+| `step4_bundle_full` | 84.43 | 0.873 | 0.975 | 0.036978 | • Introduced the **joint budget-aware bundle selector**, replacing greedy flight→hotel→… picking → `hard` up to 0.873.<br>• Traded some coherence (1.0→0.85) — the selector favored budget feasibility over zone-clustering. |
+| `single_full` | 83.95 | 0.830 | 0.975 | 0.036347 | • Deterministic-first **single**-path baseline: `coherence` 1.0, cheaper than multi.<br>• The architecture the shipped solver builds on. |
+| `multi_full` | 81.23 | 0.804 | 0.975 | 0.046358 | • Multi-agent variant with an extra LLM **decide** call — **lowest score, highest cost** ($0.046).<br>• The decide call didn't buy enough soft-fit to beat single → why the pipeline ships single-path. |
+
+Net: the dev branch clustered at **81–86**; the live solver reaches **96.23**, almost entirely by lifting
+`hard_constraint_rate` to 0.99 and `exactish` to 0.91. Smoke runs (2–5 ep, current scale) score higher
+only because they're tiny — `smoke_test` 100.00 (2 ep), `single_smoke` 90.36 (3 ep), `multi_smoke`
+87.45 (3 ep); run `python _score_history.py` for the full list.
 
 ### 2. Offline ablation study (`_ablation_results.json`, /100, zero-cost)
 
@@ -133,28 +148,50 @@ context-evolution timeline, retirement detection, and self-critic are score-neut
 — they're diagnostics/guardrails, not score drivers. Reproduce with `python _ablation_eval.py`
 (or `python _offline_eval.py` for the full-system offline number alone).
 
-### 3. Legacy experiment log (`runs/*/run.log`, old `raw_score` scale)
+### 3. Earlier 20-episode runs on the old 40/30/20/10 rubric (/100)
 
-These predate the current official /100 scorer and are on the older `raw_score` scale (~30–37) — **not
-comparable to the /100 numbers above**. Kept for development history. Sorted by score.
+These predate the current scorer. Their traces store only the obsolete 40/30/20/10
+`student_overall_score` (and never stored the `exactish` component), so they **cannot be converted to
+the current /100** — but they *are* out of 100, on that older rubric. Shown for development history;
+**not comparable to sections 1–2**. Earlier these were quoted as `raw_score` (~30–37); this is the same
+data on the rubric's native /100. Sorted by score. (2–5 episode smokes omitted; `python _score_history.py`
+lists them.)
 
-| Run dir | raw_score | decision_quality | stale_doc | spoken_rule | cost_usd | tool_calls |
+| Run | old/100 | decision_quality | hard | stale_doc | spoken_rule | cost_usd |
 |---|---:|---:|---:|---:|---:|---:|
-| `exp_gpt5nano` | 29.94 | 0.44 | 1.00 | 0.43 | 0.0184 | 5.70 |
-| `student_full_p8` | 29.80 | 0.68 | 0.39 | 0.61 | 0.1156 | 15.10 |
-| `student_full_p9` | 30.25 | 0.68 | 0.50 | 0.59 | 0.1177 | 14.15 |
-| `exp_trim9_600` | 33.79 | 0.67 | 1.00 | 0.44 | 0.0658 | 10.95 |
-| `state_enrich` | 34.72 | 0.77 | 0.93 | 0.83 | 0.0696 | 10.45 |
-| `state_enrich2` | 35.83 | 0.76 | 0.90 | 0.86 | 0.0726 | 11.15 |
-| `student_smoke_p9` | 36.11 | 0.73 | 0.50 | 0.47 | 0.0132 | 10.50 |
-| `verify_v1` | 36.66 | 0.79 | 0.88 | 0.88 | 0.0714 | 10.80 |
-| `exp_r16` | 37.11 | 0.80 | 1.00 | 0.89 | 0.0781 | 10.80 |
+| `spoken_canon_v1` | 85.69 | 0.837 | 0.709 | 1.000 | 1.000 | 0.070188 |
+| `final_test` | 84.22 | 0.798 | 0.693 | 1.000 | 0.831 | 0.065685 |
+| `retrieval_test` | 83.32 | 0.790 | 0.701 | 1.000 | 0.761 | 0.062962 |
+| `retrieval_v2_t2` | 83.03 | 0.786 | 0.674 | 1.000 | 0.761 | 0.058942 |
+| `exp_r16` | 82.27 | 0.800 | 0.666 | 1.000 | 0.894 | 0.078093 |
+| `verify_v1` | 81.70 | 0.790 | 0.698 | 0.879 | 0.883 | 0.071372 |
+| `variance_check` | 81.32 | 0.780 | 0.697 | 0.866 | 0.778 | 0.067600 |
+| `rejected_only_test` | 81.20 | 0.769 | 0.677 | 0.869 | 0.680 | 0.061959 |
+| `state_enrich2` | 79.67 | 0.759 | 0.645 | 0.901 | 0.864 | 0.072632 |
+| `retrieval_v2` | 78.56 | 0.729 | 0.643 | 1.000 | 0.681 | 0.058901 |
+| `state_enrich` | 77.70 | 0.775 | 0.657 | 0.931 | 0.828 | 0.069588 |
+| `confirm_post_revert` | 77.55 | 0.715 | 0.658 | 1.000 | 0.656 | 0.067503 |
+| `exp_trim9_600` | 75.07 | 0.671 | 0.643 | 1.000 | 0.439 | 0.065806 |
+| `post_repair_test` | 74.46 | 0.662 | 0.604 | 0.913 | 0.728 | 0.070308 |
+| `confirm_noverif` | 74.23 | 0.731 | 0.673 | 0.281 | 0.812 | 0.071810 |
+| `confirm_v6` | 71.51 | 0.711 | 0.648 | 0.532 | 0.757 | 0.086127 |
+| `confirm_v5` | 71.33 | 0.696 | 0.644 | 0.393 | 0.646 | 0.082609 |
+| `student_full_p7` | 71.04 | 0.710 | 0.658 | 0.421 | 0.657 | 0.114039 |
+| `student_full_p6` | 70.69 | 0.707 | 0.681 | 0.415 | 0.630 | 0.125472 |
+| `student_full_p9` | 68.65 | 0.684 | 0.646 | 0.495 | 0.587 | 0.117736 |
+| `student_full_p8` | 67.66 | 0.682 | 0.633 | 0.389 | 0.615 | 0.115559 |
+| `student_full_p5` | 67.56 | 0.664 | 0.631 | 0.494 | 0.604 | 0.124888 |
+| `exp_gpt5nano` | 64.73 | 0.436 | 0.430 | 1.000 | 0.428 | 0.018383 |
+| `student_full_p4` | 59.88 | 0.563 | 0.585 | 0.363 | 0.293 | 0.122484 |
+| `student_full_p3` | 57.71 | 0.556 | 0.509 | 0.366 | 0.571 | 0.090832 |
 
 ## Files
 
 - `student_solver.py` — submission entrypoint (`solve_episode(runtime)`); the full pipeline above
 - `student_custom_tools_template.py` — student-owned helper module (reranker/bundle stubs); nothing in the harness imports it, safe to extend or replace
 - `llm_eval_config_student.json` / `llm_eval_config.json` — student-tunable budgets (dev checkout uses the latter)
+- `_score_history.py` — rebuilds the /100 score history (sections 1 & 3 above) from `runs/*/llm_run_trace.jsonl`
+- `_offline_eval.py` / `_ablation_eval.py` — zero-cost deterministic eval + per-module ablation (section 2); not part of the submission
 - `dynamic_travel_replanning/` — simulator data + evaluator (do not edit)
 - `runtime_api.py`, `llm_runner.py`, `llm_tools.py`, `llm_agents.py`, `run_llm_baselines.py`, `budget_knobs.py` — staff harness (do not edit)
 

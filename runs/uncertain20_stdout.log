@@ -1,0 +1,96 @@
+[trace] run_start
+[trace] system_start system=student_solver
+[trace] episode_start system=student_solver trip_id=rtl7_public_easy_001
+[trace] episode_success system=student_solver trip_id=rtl7_public_easy_001
+[trace] episode_start system=student_solver trip_id=rtl7_public_easy_002
+[trace] episode_success system=student_solver trip_id=rtl7_public_easy_002
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_003
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_003
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_004
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_004
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_005
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_005
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_006
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_006
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_007
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_007
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_008
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_008
+[trace] episode_start system=student_solver trip_id=rtl7_public_medium_009
+[trace] episode_success system=student_solver trip_id=rtl7_public_medium_009
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_010
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_010
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_011
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_011
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_012
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_012
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_013
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_013
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_014
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_014
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_015
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_015
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_016
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_016
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_017
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_017
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_018
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_018
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_019
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_019
+[trace] episode_start system=student_solver trip_id=rtl7_public_hard_020
+[trace] episode_success system=student_solver trip_id=rtl7_public_hard_020
+[trace] system_finish system=student_solver
+[trace] public_eval_complete
+[trace] hidden_eval_skipped
+[trace] artifacts_written
+# LLM Eval Summary V4.7
+
+## Setup
+- Generated at: 2026-06-17T03:02:38.231502+00:00
+- Public episodes: 20
+- Hidden sample episodes: 0
+- Hidden sample seed: 0
+- Hidden sample trip_ids: 
+- Hidden solver visibility: hidden evaluation passes a sanitized episode to the solver (user turns + observable trip context) while the evaluator uses separate full metadata/gold; public episodes remain transparent for debugging.
+- Student budget caps present: Yes
+
+## Main Results
+| system | official_score_100 | decision_quality | distributed_context | stale_doc_retirement | distractor_avoidance | spoken_rule | cost_usd | tool_calls |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| student_solver | 99.0600 | 0.8050 | 0.2895 | 1.0000 | 1.0000 | 0.9305 | 0.000000 | 0.00 |
+
+## Ablations
+- Ablation sample trip_ids: 
+| ablation | official_score_100 | decision_quality | stale_doc_retirement | spoken_rule | cost_usd |
+| --- | ---: | ---: | ---: | ---: | ---: |
+
+## Required Analysis
+1. Hidden set leakage fix
+Hidden evaluation no longer reads `gold` from the executable hidden episode file. `episodes_hidden_input.json` contains only observable fields, while `episodes_hidden_gold.json` stores evaluator-only labels keyed by trip id. The runtime joins them only inside the evaluator path.
+2. Tool-use structure
+The harness now runs actual Responses API function-calling loops. Agents start with only episode context, then selectively call filtered tools such as `search_flights`, `search_hotels`, `search_restaurants`, `search_activities`, `search_memory`, and `get_rejected_options`. Inventory is no longer prepacked into the prompt.
+3. Retrieval corpus difficulty
+The benchmark now includes canonical docs, stale notes, distractor traveler notes, alternative venue playbooks, and explicit heuristics in `memory_corpus.json`, plus `rejected_options_memory.json`. This makes retrieval choice, stale retirement, and distractor avoidance matter instead of always pulling the same 3 docs.
+4. Heuristic pre-processing reduction
+Strong shortlist construction, bundle ranking, forced ID repair, and Python-side spoken-rule parsing were removed from the execution path. Python now provides environment search, retrieval indexing, tool dispatch, and result validation only.
+5. Did MAS beat semantic single-agent?
+Not evaluated in this run because neither `llm_memory_single` nor `llm_anchor_mas` was included in `--systems`.
+6. Did retrieval / retirement / spoken-rule metrics separate?
+Not enough systems were included to compare retrieval / retirement / spoken-rule separation in this run.
+7. Cost vs performance
+Cost comparison across the canonical baseline/memory/MAS trio is unavailable for this run.
+8. Remaining limits
+The benchmark is now stricter and more LLM-native, but the inventory is still relatively small, hidden gold still exists locally for TA-side grading, and the harness still relies on model-reported memory summaries rather than a fully independently derived semantic memory state.
+
+## Hidden Sample Results
+| system | official_score_100 | decision_quality | stale_doc_retirement | distractor_avoidance | cost_usd |
+| --- | ---: | ---: | ---: | ---: | ---: |
+
+## Best Public System
+`student_solver` with official /100 score 99.0600.
+
+## API Status
+All API calls succeeded: Yes
+
+[trace] run_finish

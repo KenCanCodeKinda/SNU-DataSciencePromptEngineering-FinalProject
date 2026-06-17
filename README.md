@@ -185,6 +185,57 @@ lists them.)
 | `student_full_p4` | 59.88 | 0.563 | 0.585 | 0.363 | 0.293 | 0.122484 |
 | `student_full_p3` | 57.71 | 0.556 | 0.509 | 0.366 | 0.571 | 0.090832 |
 
+## Donghyun Ken Kim's Additional Contribution
+
+The shipped solver already scores **96.23/100** and maxes every bucket except cost. So the question
+I set out to answer was not "how do I lift a weak metric" but "where is there *real* headroom left,
+and can I take it without destabilising known-good code." Reading the scoreboard honestly, there are
+only two levers: **efficiency** (7.17/10, purely cost) and **hidden-set generalisation** (the public
+offline path scores a perfect 100 — but those are the 20 episodes the heuristics were tuned on, so
+100 is an overfit ceiling, not proof of robustness).
+
+I prototyped every experiment on the **zero-cost offline harness** (`_offline_eval.py`, the real
+deterministic path with `gold` + `scenario_state` stripped, mirroring hidden eval) plus a new
+**`_robustness_probe.py`** that rephrases the user turns into the same rtl7 register a hidden episode
+might use. The headline change was then **confirmed on the real graded harness** (`gpt-5.4-nano`,
+20 public episodes, same code — only the `llm_planner_when` knob differs):
+
+| Mode | Official /100 | Quality (non-cost) | Cost (20 ep) | LLM tool calls/ep |
+|---|---:|---:|---:|---:|
+| `always` (= the shipped baseline) | 96.00 | 89.06 / 90 | $0.043229 | 8.60 |
+| `uncertain` (**new default**) | **99.06** | 89.06 / 90 | **$0.000000** | 0.00 |
+
+**+3.06 points at exactly zero quality cost.** The gate recovers the entire efficiency bucket
+(6.94 → 10.0/10) because the planner fires 0× and the deterministic gather is lexical (free). Every
+quality metric is byte-identical across the two runs (`decision_quality` 0.805, `stale_doc` 1.0,
+`distractor` 1.0, `spoken_rule` 0.9305) — so on the public set the LLM tie-breaker was contributing
+*nothing but cost*. The gain is larger on the 50-episode staff rerun, where the un-gated cost (~$0.10)
+drags efficiency to ~0.29 (`0.03 / total_cost`, total baseline). Runs archived at
+`runs/always20/` and `runs/uncertain20/`.
+
+| # | Experiment | Measured effect | Adopted? | Why |
+|---|---|---|:--:|---|
+| 1 | **Confidence-gated LLM planner** — run `_python_select` first; only spend the LLM call when the strict (zone+budget) search has to relax. New `llm_planner_when` knob: `uncertain` (default) / `always` (legacy) / `never`. | **Measured on the real harness: 96.00 → 99.06/100** (+3.06), cost **$0.043 → $0.00**, quality buckets byte-identical. LLM fired **0/20** (was 20/20). Larger gain on the 50-ep staff rerun (un-gated efficiency ~0.29). | ✅ | The LLM is only a soft tie-breaker (last term of `combo_score`); on every confident episode the deterministic bundle is identical with or without it. Gating keeps the hedge **exactly where the solver is unsure** and removes its cost everywhere else. |
+| 2 | **Corpus-driven stale-doc gather** — supplement the hardcoded `stale:*` list (tuned to public cities OSA/TPE/SIN) with a generic city/family-scoped `search_memory(include_stale=True)` query. | Public **unchanged at 100.0** (`stale_doc`/`update`/`rejected` all still 1.0); zero added cost (lexical). | ✅ | Additive and recall-only, so it can only help or be neutral for `stale_doc_retirement`. Targets a concrete overfit: a hidden city's stale docs aren't in the hardcoded list and would otherwise never surface into the trace. *(Public-neutral; the hidden-city benefit is plausible but unconfirmed.)* |
+| 3 | **Extraction synonym-hardening** — `vegan→plant-based`, `red-eye→overnight`, `quiet→low-noise`. | Robustness probe: **100.0 under every rephrasing**, no change vs. baseline. | ❌ | No measurable benefit — and a real downside (a new trigger word can false-positive on hidden text and flip a constraint). A rephrasing *can* flip a flag (`plant-based` does make `_extract_constraints` read `teammate_vegan=False`), but the bundle survives anyway because `_python_select`'s richness scoring independently favours the vegan-capable / rich-tag options the gold accepts — so the heuristics are *incidentally* robust to wording here, and hardening buys nothing measurable. |
+| 4 | **Disable the LLM entirely** (`llm_planner_when="never"`). | Same offline 100.0 + efficiency pinned at 1.0. | ❌ (kept as an option) | Highest efficiency, but it throws away the generalisation hedge the original author deliberately shipped. Conditional (#1) captures ~all the efficiency win while keeping the hedge — strictly more conservative. |
+| 5 | **Cheaper planner model** (`gpt-5-nano`, per the headline note). | Early dev run `step3_model_swap` ≈halved cost with no quality loss. | ❌ | Largely **superseded by #1**: once the planner rarely fires, the cost of the model it would have used is moot. Worth a paid A/B only if hidden episodes turn out to relax often. |
+
+**Net:** two adopted changes (#1, #2). #1 is the headline — **measured 96.00 → 99.06/100 at zero
+quality cost**, the largest single jump in the project's score history, and it grows on the larger
+unseen staff rerun. #2 is a public-neutral generalisation hedge. Three honest non-wins (#3–#5) are
+documented rather than merged, in keeping with the project's own log of well-intentioned regressions.
+
+**What ships changed:** the shipped default is now `llm_planner_when="uncertain"`. The previous
+known-good 96.0 run was effectively `"always"` (the planner fired on every episode); set
+`llm_planner_when="always"` to restore that exact baseline byte-for-byte if a conscious revert is
+wanted for grading.
+
+Reproduce: `python _offline_eval.py` (full-system offline = 100.0), `python _robustness_probe.py`
+(rephrasing robustness), and the gate behaviour with
+`student_solver.solve_episode` under a runner that counts LLM calls (0 on public under the default
+`uncertain` mode). All zero-cost.
+
 ## Files
 
 - `student_solver.py` — submission entrypoint (`solve_episode(runtime)`); the full pipeline above
@@ -192,6 +243,7 @@ lists them.)
 - `llm_eval_config_student.json` / `llm_eval_config.json` — student-tunable budgets (dev checkout uses the latter)
 - `_score_history.py` — rebuilds the /100 score history (sections 1 & 3 above) from `runs/*/llm_run_trace.jsonl`
 - `_offline_eval.py` / `_ablation_eval.py` — zero-cost deterministic eval + per-module ablation (section 2); not part of the submission
+- `_robustness_probe.py` — zero-cost generalisation probe; rephrases user turns and re-scores the deterministic path (see *Additional Contribution* #3); not part of the submission
 - `dynamic_travel_replanning/` — simulator data + evaluator (do not edit)
 - `runtime_api.py`, `llm_runner.py`, `llm_tools.py`, `llm_agents.py`, `run_llm_baselines.py`, `budget_knobs.py` — staff harness (do not edit)
 
